@@ -1467,8 +1467,11 @@ int ofono_get_network_status(char *status, int size) {
 static time_t g_last_egress_bounce_ts = 0;
 
 static int ofono_egress_reachable(void) {
-  /* CN: 114 -> AliDNS 223.5.5.5; 8.8.8.8 last (may be blocked) */
-  if (system("ping -c 1 -W 2 114.114.114.114 >/dev/null 2>&1") == 0) {
+  /* CN carrier DNS first; AliDNS then 8.8.8.8 as fallback */
+  if (system("ping -c 1 -W 2 211.138.245.180 >/dev/null 2>&1") == 0) {
+    return 1;
+  }
+  if (system("ping -c 1 -W 2 211.138.240.100 >/dev/null 2>&1") == 0) {
     return 1;
   }
   if (system("ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1") == 0) {
