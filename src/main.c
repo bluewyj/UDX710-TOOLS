@@ -35,9 +35,16 @@ int main(int argc, char *argv[]) {
   printf("启动数据连接监听...\n");
   ofono_start_data_monitor();
 
+  /* 定时巡检：信号漏报时仍能发现 zombie Active 并 bounce PDP */
+  printf("启动数据连接 Watchdog (60s)...\n");
+  if (ofono_start_data_watchdog(60) != 0) {
+    fprintf(stderr, "警告: 数据连接 Watchdog 启动失败\n");
+  }
+
   /* 启动 HTTP 服务器 */
   if (http_server_start(port) != 0) {
     fprintf(stderr, "服务器启动失败\n");
+    ofono_stop_data_watchdog();
     ofono_stop_data_monitor();
     ofono_deinit();
     return 1;
@@ -48,6 +55,7 @@ int main(int argc, char *argv[]) {
 
   /* 清理 */
   http_server_stop();
+  ofono_stop_data_watchdog();
   ofono_stop_data_monitor();
   ofono_deinit();
 
