@@ -72,15 +72,14 @@ jobs:
       - name: dopack
         run: |
           mkdir -p output/6677
-          echo "#!/bin/sh" > start.sh
-          echo "cd /home/root/6677" >> start.sh
-          echo "chmod 755 *" >> start.sh
-          echo "./server &" >> start.sh
-          mv start.sh output/6677/
+          # Robust launcher (absolute path + nohup); see packaging/start.sh
+          cp packaging/start.sh output/6677/start.sh
+          chmod 755 output/6677/start.sh
           cp -r web/dist output/6677/
           cp src/build/ofono-server output/6677/server
           file output/6677/server
           ls -la output/6677/server
+          head -n 20 output/6677/start.sh
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
