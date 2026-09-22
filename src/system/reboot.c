@@ -92,8 +92,10 @@ void handle_set_reboot(struct mg_connection *c, struct mg_http_message *hm) {
     snprintf(cmd, sizeof(cmd), "sed -i '/reboot/d' %s 2>/dev/null || true", CRON_FILE);
     run_command(output, sizeof(output), "sh", "-c", cmd, NULL);
 
-    /* 添加新任�?*/
-    snprintf(cmd, sizeof(cmd), "echo '%s %s * * %s /sbin/reboot' >> %s", minute, hour, day, CRON_FILE);
+    /* Soft reboot must set H9 marker so usb-tether does UDC re-enum */
+    snprintf(cmd, sizeof(cmd),
+             "echo '%s %s * * %s touch /mnt/data/need-usb-renum; /sbin/reboot' >> %s",
+             minute, hour, day, CRON_FILE);
     if (run_command(output, sizeof(output), "sh", "-c", cmd, NULL) != 0) {
         JsonBuilder *j = json_new();
         json_obj_open(j);
