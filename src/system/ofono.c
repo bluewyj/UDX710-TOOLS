@@ -1467,11 +1467,14 @@ int ofono_get_network_status(char *status, int size) {
 static time_t g_last_egress_bounce_ts = 0;
 
 static int ofono_egress_reachable(void) {
-  /* BusyBox ping: -W 秒；失败再试国内公共 DNS，降低单点误判 */
-  if (system("ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1") == 0) {
+  /* CN: 114 -> AliDNS 223.5.5.5; 8.8.8.8 last (may be blocked) */
+  if (system("ping -c 1 -W 2 114.114.114.114 >/dev/null 2>&1") == 0) {
     return 1;
   }
-  if (system("ping -c 1 -W 2 114.114.114.114 >/dev/null 2>&1") == 0) {
+  if (system("ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1") == 0) {
+    return 1;
+  }
+  if (system("ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1") == 0) {
     return 1;
   }
   return 0;
