@@ -6,7 +6,7 @@ on:
 
 jobs:
   build-arm:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout code
@@ -14,24 +14,43 @@ jobs:
 
       - name: Install dependencies
         run: |
+          set -euo pipefail
           curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
           sudo apt-get update
-          sudo apt-get install -y nodejs
+          sudo apt-get install -y nodejs wget xz-utils
 
-      - name: Cache cross compiler (aarch64)
+      # Device glibc is older than Ubuntu 22.04 apt cross-gcc (needs GLIBC_2.33+).
+      # Use Linaro 7.5 (glibc ~2.25). releases.linaro.org is dead → HuggingFace mirror.
+      - name: Cache Linaro 7.5 aarch64 toolchain
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/tools/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu
-          key: gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu
+          key: gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu-v3
 
-      - name: Configure cross compiler (aarch64)
+      - name: Configure Linaro 7.5 cross compiler
         run: |
-          mkdir -p $GITHUB_WORKSPACE/tools
-          if [ ! -d "$GITHUB_WORKSPACE/tools/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu" ]; then
-            wget https://releases.linaro.org/components/toolchain/binaries/7.5-2019.12/aarch64-linux-gnu/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu.tar.xz
-            tar xf gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu.tar.xz -C $GITHUB_WORKSPACE/tools
+          set -euo pipefail
+          TOOLS="$GITHUB_WORKSPACE/tools"
+          TC="$TOOLS/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu"
+          ARCHIVE="gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu.tar.xz"
+          mkdir -p "$TOOLS"
+
+          if [ ! -x "$TC/bin/aarch64-linux-gnu-gcc" ]; then
+            URL="https://huggingface.co/csukuangfj/sherpa-ncnn-toolchains/resolve/main/${ARCHIVE}"
+            echo "Downloading $URL"
+            wget -q --show-progress -O "$ARCHIVE" "$URL"
+            size=$(wc -c < "$ARCHIVE")
+            echo "Downloaded $size bytes"
+            if [ "$size" -lt 1000000 ]; then
+              echo "Download too small — refusing to extract"
+              exit 1
+            fi
+            xz -t "$ARCHIVE"
+            tar xf "$ARCHIVE" -C "$TOOLS"
           fi
-          echo "PATH=$PATH:$GITHUB_WORKSPACE/tools/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu/bin" >> $GITHUB_ENV
+
+          echo "PATH=$PATH:$TC/bin" >> "$GITHUB_ENV"
+          "$TC/bin/aarch64-linux-gnu-gcc" --version
 
       - name: build web
         run: |
@@ -42,21 +61,28 @@ jobs:
         run: |
           cd src
           make
+          # Sanity: binary should NOT require GLIBC_2.33+
+          aarch64-linux-gnu-readelf -V build/ofono-server | tee /tmp/glibc-versions.txt || true
+          if aarch64-linux-gnu-readelf -V build/ofono-server 2>/dev/null | grep -E 'GLIBC_2\.(3[3-9]|[4-9][0-9])'; then
+            echo "ERROR: binary requires too-new GLIBC for device"
+            exit 1
+          fi
+          echo "GLIBC check OK"
 
       - name: dopack
         run: |
           mkdir -p output/6677
-          echo "#!/bin/sh" > start.sh
-          echo "cd /home/root/6677" >> start.sh
-          echo "chmod 755 *" >> start.sh
-          echo "./server &" >> start.sh
-          mv start.sh output/6677/
+          # Robust launcher (absolute path + nohup); see packaging/start.sh
+          cp packaging/start.sh output/6677/start.sh
+          chmod 755 output/6677/start.sh
           cp -r web/dist output/6677/
           cp src/build/ofono-server output/6677/server
+          file output/6677/server
+          ls -la output/6677/server
+          head -n 20 output/6677/start.sh
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: udx710-tools
           path: output
-

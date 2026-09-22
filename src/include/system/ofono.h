@@ -211,7 +211,8 @@ int ofono_get_network_status(char *status, int size);
 
 /**
  * 检查并恢复数据连接
- * 检查当前数据连接状态，如果APN已配置但未激活则自动激活
+ * - APN 已配置且 Active=false → 尝试激活
+ * - Active=true 但公网 ICMP 不可达 → bounce PDP（false→true），冷却 90s
  * @param result 输出结果描述字符串
  * @param size 缓冲区大小
  * @return 成功返回0，失败返回错误码

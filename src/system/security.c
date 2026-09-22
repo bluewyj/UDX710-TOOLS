@@ -7,6 +7,7 @@
 #include "security.h"
 #include "auth.h"
 #include "database.h"
+#include "exec_utils.h"
 #include "sha256.h"
 
 #define SECURITY_ICCID_MAX_LEN 24 /* ICCID最大长度(仅内部使用) */
@@ -329,8 +330,8 @@ int security_factory_reset(const SecurityVerifyRequest *req) {
 
   printf("[Security] ✅ 出厂重置完成，正在重启系统...\n");
 
-  /* 重启整个系统 */
-  system("reboot");
+  /* Soft reboot: H9 marker via device_reboot (same as UI reboot) */
+  device_reboot();
 
   return 0;
 }
