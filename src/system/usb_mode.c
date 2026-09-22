@@ -387,6 +387,20 @@ static int create_function_link(const char *func_name, const char *link_name) {
     return 0;
 }
 
+/* Prefer real cellular uplink (UDX710 uses sipa_eth0; older images may use rmnet) */
+static const char *pick_cellular_uplink(void) {
+    if (access("/sys/class/net/sipa_eth0", F_OK) == 0) {
+        return "sipa_eth0";
+    }
+    if (access("/sys/class/net/ccinet0", F_OK) == 0) {
+        return "ccinet0";
+    }
+    if (access("/sys/class/net/rmnet_data0", F_OK) == 0) {
+        return "rmnet_data0";
+    }
+    return "sipa_eth0";
+}
+
 /* 配置 USB 网络接口 */
 static void configure_usb_network(void) {
     /* 等待接口出现 */
@@ -404,6 +418,7 @@ static void configure_usb_network(void) {
     
     /* 2. 查找并配置 USB 网络接口 */
     const char *ifaces[] = {"usb0", "rndis0", NULL};
+    const char *uplink = pick_cellular_uplink();
     char cmd[256];
     
     for (int retry = 0; retry < 5; retry++) {
@@ -425,9 +440,16 @@ static void configure_usb_network(void) {
                 snprintf(cmd, sizeof(cmd), "ip link set dev %s up", ifaces[i]);
                 run_cmd(cmd);
                 
-                /* 配置 iptables NAT */
-                run_cmd("iptables -t nat -A POSTROUTING -o rmnet_data0 -j MASQUERADE 2>/dev/null");
-                snprintf(cmd, sizeof(cmd), "iptables -A FORWARD -i %s -j ACCEPT 2>/dev/null", ifaces[i]);
+                /* NAT to actual cellular uplink (not hardcoded rmnet_data0) */
+                snprintf(cmd, sizeof(cmd),
+                         "iptables -t nat -C POSTROUTING -o %s -j MASQUERADE 2>/dev/null || "
+                         "iptables -t nat -A POSTROUTING -o %s -j MASQUERADE 2>/dev/null",
+                         uplink, uplink);
+                run_cmd(cmd);
+                snprintf(cmd, sizeof(cmd),
+                         "iptables -C FORWARD -i %s -j ACCEPT 2>/dev/null || "
+                         "iptables -A FORWARD -i %s -j ACCEPT 2>/dev/null",
+                         ifaces[i], ifaces[i]);
                 run_cmd(cmd);
                 
                 goto network_done;
