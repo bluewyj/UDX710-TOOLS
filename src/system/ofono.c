@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ==================== 常量定义 ==================== */
@@ -1460,8 +1461,47 @@ int ofono_get_network_status(char *status, int size) {
   return ret;
 }
 
+/* 壳侧 egress 探测：Active=true 不等于用户面可用（zombie Active）。 */
+#define OFONO_EGRESS_BOUNCE_COOLDOWN_S 90
+
+static time_t g_last_egress_bounce_ts = 0;
+
+static int ofono_egress_reachable(void) {
+  /* BusyBox ping: -W 秒；失败再试国内公共 DNS，降低单点误判 */
+  if (system("ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1") == 0) {
+    return 1;
+  }
+  if (system("ping -c 1 -W 2 114.114.114.114 >/dev/null 2>&1") == 0) {
+    return 1;
+  }
+  return 0;
+}
+
+/**
+ * 强制 PDP 翻转（等同补丁 bounce-pdp）。
+ * 使用 ofono_set_data_status：关闭后再开启会重新拉起 DataMonitor。
+ */
+static int ofono_bounce_pdp(void) {
+  time_t now = time(NULL);
+  if (g_last_egress_bounce_ts != 0 &&
+      (now - g_last_egress_bounce_ts) < OFONO_EGRESS_BOUNCE_COOLDOWN_S) {
+    return -2; /* 冷却中 */
+  }
+  g_last_egress_bounce_ts = now;
+
+  printf("[DataRestore] egress dead while Active — bouncing PDP\n");
+  (void)ofono_set_data_status(0);
+  sleep(3);
+  if (ofono_set_data_status(1) != 0) {
+    return -1;
+  }
+  sleep(2);
+  return ofono_egress_reachable() ? 0 : -1;
+}
+
 /**
  * 检查并恢复数据连接
+ * Active=false → 尝试激活；Active=true 仍须 egress 可达，否则 bounce PDP
  */
 int ofono_check_and_restore_data(char *result, int size) {
   char net_status[64] = {0};
@@ -1547,13 +1587,28 @@ int ofono_check_and_restore_data(char *result, int size) {
     return 0;
   }
 
-  /* 5. 如果已激活，返回正常状态 */
+  /* 5. Active=true：必须 egress 可达，否则视为 zombie Active 并 bounce */
   if (active) {
-    snprintf(result, size, "已连接 (APN: %s)", apn);
-    return 0;
+    if (ofono_egress_reachable()) {
+      snprintf(result, size, "已连接 (APN: %s)", apn);
+      return 0;
+    }
+    {
+      int br = ofono_bounce_pdp();
+      if (br == 0) {
+        snprintf(result, size, "egress 恢复 (bounce PDP, APN: %s)", apn);
+        return 0;
+      }
+      if (br == -2) {
+        snprintf(result, size, "egress 异常，bounce 冷却中 (APN: %s)", apn);
+        return -1;
+      }
+      snprintf(result, size, "egress 异常，bounce 失败 (APN: %s)", apn);
+      return -1;
+    }
   }
 
-  /* 6. 尝试激活数据连接 */
+  /* 6. Active=false：尝试激活数据连接 */
   if (ofono_set_data_status(1) == 0) {
     snprintf(result, size, "连接已恢复 (APN: %s)", apn);
     return 0;
