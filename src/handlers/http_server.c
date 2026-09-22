@@ -507,6 +507,9 @@ int http_server_start(const char *port) {
 
   /* 初始化 mongoose */
   mg_mgr_init(&g_mgr);
+  /* CN: avoid Google DNS (may be blocked); AliDNS for mg hostname resolve */
+  g_mgr.dns4.url = "udp://223.5.5.5:53";
+  g_mgr.dns6.url = "udp://[2400:3200::1]:53";
 
   /* 构建监听地址 - 使用 0.0.0.0 监听所有IPv4地址 */
   snprintf(listen_addr, sizeof(listen_addr), "http://0.0.0.0:%s", port);
