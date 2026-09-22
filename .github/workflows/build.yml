@@ -16,22 +16,62 @@ jobs:
         run: |
           curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
           sudo apt-get update
-          sudo apt-get install -y nodejs
+          sudo apt-get install -y nodejs wget xz-utils
 
+      # releases.linaro.org now 301s to an HTML contact page; keep Linaro 7.5 via mirror
+      # so device glibc stays compatible with historical CI builds.
       - name: Cache cross compiler (aarch64)
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/tools/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu
-          key: gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu
+          key: gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu-v2
 
       - name: Configure cross compiler (aarch64)
         run: |
-          mkdir -p $GITHUB_WORKSPACE/tools
-          if [ ! -d "$GITHUB_WORKSPACE/tools/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu" ]; then
-            wget https://releases.linaro.org/components/toolchain/binaries/7.5-2019.12/aarch64-linux-gnu/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu.tar.xz
-            tar xf gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu.tar.xz -C $GITHUB_WORKSPACE/tools
+          set -euo pipefail
+          TOOLS="$GITHUB_WORKSPACE/tools"
+          TC="$TOOLS/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu"
+          ARCHIVE="gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu.tar.xz"
+          mkdir -p "$TOOLS"
+
+          if [ ! -x "$TC/bin/aarch64-linux-gnu-gcc" ]; then
+            # Primary: HuggingFace mirror of the same Linaro 7.5 tarball
+            URLS=(
+              "https://huggingface.co/csukuangfj/sherpa-ncnn-toolchains/resolve/main/${ARCHIVE}"
+              "https://github.com/csukuangfj/sherpa-ncnn-toolchains/releases/download/gcc-linaro-7.5.0-2019.12/${ARCHIVE}"
+            )
+            ok=0
+            for url in "${URLS[@]}"; do
+              echo "Trying: $url"
+              if wget -q --show-progress -O "$ARCHIVE" "$url"; then
+                # Real xz is tens of MB; HTML redirect pages are ~60KB
+                size=$(wc -c < "$ARCHIVE")
+                if [ "$size" -lt 1000000 ]; then
+                  echo "Download too small ($size bytes), not a toolchain archive"
+                  rm -f "$ARCHIVE"
+                  continue
+                fi
+                if ! xz -t "$ARCHIVE"; then
+                  echo "Not a valid xz archive"
+                  rm -f "$ARCHIVE"
+                  continue
+                fi
+                tar xf "$ARCHIVE" -C "$TOOLS"
+                ok=1
+                break
+              fi
+            done
+            if [ "$ok" != "1" ]; then
+              echo "All Linaro mirrors failed; falling back to apt cross-gcc"
+              sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+              which aarch64-linux-gnu-gcc
+              aarch64-linux-gnu-gcc --version
+              exit 0
+            fi
           fi
-          echo "PATH=$PATH:$GITHUB_WORKSPACE/tools/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu/bin" >> $GITHUB_ENV
+
+          echo "PATH=$PATH:$TC/bin" >> "$GITHUB_ENV"
+          "$TC/bin/aarch64-linux-gnu-gcc" --version
 
       - name: build web
         run: |
@@ -59,4 +99,3 @@ jobs:
         with:
           name: udx710-tools
           path: output
-
