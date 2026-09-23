@@ -7,9 +7,17 @@
 #include "netif.h"
 #include "ofono.h"
 #include "platform_setup.h"
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static void *ofono_usb_share_at_thread(void *arg) {
+  (void)arg;
+  if (ofono_enable_usb_share_at() != 0)
+    fprintf(stderr, "警告: USB share AT 发送失败\n");
+  return NULL;
+}
 
 int main(int argc, char *argv[]) {
   const char *port = "6677";
@@ -27,6 +35,14 @@ int main(int argc, char *argv[]) {
   /* 初始化 ofono D-Bus 连接 */
   if (!ofono_init()) {
     fprintf(stderr, "警告: ofono D-Bus 连接失败，部分功能可能不可用\n");
+  }
+
+  /* USB share AT：后台发送，不阻塞 HTTP/管理面启动 */
+  {
+    pthread_t usb_share_tid;
+    if (pthread_create(&usb_share_tid, NULL, ofono_usb_share_at_thread, NULL) ==
+        0)
+      pthread_detach(usb_share_tid);
   }
 
   /* 初始化网络接口监听（自动恢复之前启用的监听） */

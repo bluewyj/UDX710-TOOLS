@@ -35,6 +35,13 @@ int ofono_is_initialized(void);
 void ofono_deinit(void);
 
 /**
+ * 通过 modem 串口发送 USB share AT（对齐 enable-usb-share-at.sh）
+ * 等待 /dev/stty_lte30 最多约 30s，最多 5 次写入；失败不阻断管理面启动
+ * @return 成功返回 0，失败返回 -1
+ */
+int ofono_enable_usb_share_at(void);
+
+/**
  * 获取网络模式
  * @param modem_path modem 路径，如 "/ril_0"
  * @param buffer 输出缓冲区

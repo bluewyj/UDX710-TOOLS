@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -291,6 +292,37 @@ void ofono_deinit(void) {
     g_object_unref(g_dbus_conn);
     g_dbus_conn = NULL;
   }
+}
+
+int ofono_enable_usb_share_at(void) {
+  const char *dev = "/dev/stty_lte30";
+  const char *at = "AT+SPASENGMD=\"#dsm_usb_share_enable\",1\r";
+  int n;
+
+  for (n = 0; n < 30; n++) {
+    struct stat st;
+    if (stat(dev, &st) == 0 && S_ISCHR(st.st_mode))
+      break;
+    sleep(1);
+  }
+  if (n >= 30) {
+    printf("[USBShare] stty_lte30 missing\n");
+    return -1;
+  }
+
+  for (n = 0; n < 5; n++) {
+    FILE *f = fopen(dev, "w");
+    if (f) {
+      fputs(at, f);
+      fclose(f);
+      printf("[USBShare] AT sent attempt=%d\n", n + 1);
+      return 0;
+    }
+    sleep(2);
+  }
+
+  printf("[USBShare] failed to write AT after 5 attempts\n");
+  return -1;
 }
 
 int ofono_network_get_mode_sync(const char *modem_path, char *buffer, int size,
