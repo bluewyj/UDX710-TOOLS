@@ -1587,6 +1587,7 @@ static int ofono_egress_reachable(void) {
 
 int ofono_bounce_pdp_context(void) {
   (void)ofono_set_data_status(0);
+  /* ofono lock released during bounce wait */
   sleep(4);
   if (ofono_set_data_status(1) != 0) {
     return -1;
