@@ -256,25 +256,41 @@ static int read_sysfs(const char *path, char *buf, size_t size) {
     return 0;
 }
 
-/* 对齐 device_dump/home_root/fix-rndis-link.sh */
+/* 1=ef/04/01 已正确, 0=需修正, -1=rndis.gs4 未就绪 */
+static int rndis_class_is_correct(void) {
+    char class_path[256], sub_path[256], proto_path[256];
+    char cur[16], sub[8] = {0}, proto[8] = {0};
+
+    snprintf(class_path, sizeof(class_path), "%s/rndis.gs4/class", USB_FUNCTIONS_PATH);
+    snprintf(sub_path, sizeof(sub_path), "%s/rndis.gs4/subclass", USB_FUNCTIONS_PATH);
+    snprintf(proto_path, sizeof(proto_path), "%s/rndis.gs4/protocol", USB_FUNCTIONS_PATH);
+    if (access(class_path, F_OK) != 0)
+        return -1;
+    if (read_sysfs(class_path, cur, sizeof(cur)) != 0 || strcmp(cur, "ef") != 0)
+        return 0;
+    read_sysfs(sub_path, sub, sizeof(sub));
+    read_sysfs(proto_path, proto, sizeof(proto));
+    if (strcmp(sub, "04") == 0 && strcmp(proto, "01") == 0)
+        return 1;
+    return 0;
+}
+
+/* 对齐 device_dump/home_root/fix-rndis-link.sh（假定 UDC 已解绑或可写） */
 static int usb_mode_ensure_rndis_descriptors(void) {
     char class_path[256], sub_path[256], proto_path[256], qmult_path[256];
-    char cur[16];
+    int cls = rndis_class_is_correct();
+
+    if (cls < 0) {
+        printf("[usb_mode] rndis.gs4 not ready, skip class fix\n");
+        return 0;
+    }
+    if (cls > 0)
+        return 0;
+
     snprintf(class_path, sizeof(class_path), "%s/rndis.gs4/class", USB_FUNCTIONS_PATH);
     snprintf(sub_path, sizeof(sub_path), "%s/rndis.gs4/subclass", USB_FUNCTIONS_PATH);
     snprintf(proto_path, sizeof(proto_path), "%s/rndis.gs4/protocol", USB_FUNCTIONS_PATH);
     snprintf(qmult_path, sizeof(qmult_path), "%s/rndis.gs4/qmult", USB_FUNCTIONS_PATH);
-    if (access(class_path, F_OK) != 0) {
-        printf("[usb_mode] rndis.gs4 not ready, skip class fix\n");
-        return 0;
-    }
-    if (read_sysfs(class_path, cur, sizeof(cur)) == 0 && strcmp(cur, "ef") == 0) {
-        char sub[8] = {0}, proto[8] = {0};
-        read_sysfs(sub_path, sub, sizeof(sub));
-        read_sysfs(proto_path, proto, sizeof(proto));
-        if (strcmp(sub, "04") == 0 && strcmp(proto, "01") == 0)
-            return 0; /* already correct */
-    }
     printf("[usb_mode] force rndis class ef/04/01\n");
     if (write_sysfs(class_path, "ef") != 0 ||
         write_sysfs(sub_path, "04") != 0 ||
@@ -286,6 +302,43 @@ static int usb_mode_ensure_rndis_descriptors(void) {
     if (access(PAMU3_PROTOCOL_PATH, F_OK) == 0)
         (void)write_sysfs(PAMU3_PROTOCOL_PATH, "RNDIS");
     (void)write_sysfs("/sys/devices/platform/soc/soc:ipa/2b300000.pamu3/max_dl_pkts", "7");
+    return 0;
+}
+
+/* 启动时对齐 fix-rndis-link.sh：已正确则 no-op；否则必要时 UDC 周期后写入 */
+int usb_mode_ensure_rndis_link(void) {
+    char udc_cur[64] = {0};
+    int was_bound = 0;
+    int cls = rndis_class_is_correct();
+    int ret;
+
+    if (cls < 0) {
+        printf("[usb_mode] rndis.gs4 not ready, skip rndis link ensure\n");
+        return 0;
+    }
+    if (cls > 0)
+        return 0;
+
+    if (read_sysfs(USB_UDC_PATH, udc_cur, sizeof(udc_cur)) == 0 &&
+        udc_cur[0] != '\0' && strcmp(udc_cur, "none") != 0) {
+        was_bound = 1;
+        printf("[usb_mode] unbind UDC (%s) for rndis class fix\n", udc_cur);
+        if (write_sysfs(USB_UDC_PATH, "none") != 0)
+            return -1;
+        sleep(1);
+    }
+
+    ret = usb_mode_ensure_rndis_descriptors();
+    if (ret != 0)
+        return ret;
+
+    if (was_bound) {
+        printf("[usb_mode] rebind UDC (%s) after rndis class fix\n", udc_cur);
+        if (write_sysfs(USB_UDC_PATH, udc_cur) != 0)
+            return -1;
+        usleep(1000000);
+    }
+
     return 0;
 }
 
@@ -615,7 +668,7 @@ int usb_mode_switch_advanced(int mode) {
     
     /* 14b. RNDIS: force class ef/04/01 before UDC bind */
     if (mode == USB_MODE_RNDIS) {
-        int ret = usb_mode_ensure_rndis_descriptors();
+        int ret = usb_mode_ensure_rndis_link();
         if (ret != 0)
             return ret;
     }

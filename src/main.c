@@ -7,6 +7,7 @@
 #include "netif.h"
 #include "ofono.h"
 #include "platform_setup.h"
+#include "usb_mode.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,6 +62,11 @@ int main(int argc, char *argv[]) {
   /* 首启幂等写入 platform USB/APN 配置文件 */
   if (platform_setup_ensure() != 0) {
     fprintf(stderr, "警告: platform_setup_ensure 失败\n");
+  }
+
+  /* 启动时纠正 RNDIS class（必要时 UDC 周期，对齐 fix-rndis-link.sh） */
+  if (usb_mode_ensure_rndis_link() != 0) {
+    fprintf(stderr, "警告: usb_mode_ensure_rndis_link 失败\n");
   }
 
   /* 启动 HTTP 服务器 */
