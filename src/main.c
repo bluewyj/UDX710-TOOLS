@@ -12,9 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
-#include <sys/stat.h>
 
 static void *ofono_usb_share_at_thread(void *arg) {
   (void)arg;
@@ -22,27 +20,6 @@ static void *ofono_usb_share_at_thread(void *arg) {
     fprintf(stderr, "警告: USB share AT 发送失败\n");
   return NULL;
 }
-
-/* #region agent log */
-static void debug_aa8e5b_log(const char *hypothesis_id, const char *location,
-                             const char *message, const char *data_json) {
-  FILE *f;
-  struct timespec ts;
-  long long ms;
-
-  mkdir("/mnt/data/logs", 0755);
-  f = fopen("/mnt/data/logs/debug-aa8e5b.log", "a");
-  if (!f)
-    return;
-  clock_gettime(CLOCK_REALTIME, &ts);
-  ms = (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
-  fprintf(f,
-          "{\"sessionId\":\"aa8e5b\",\"runId\":\"post-fix\",\"hypothesisId\":\"%s\","
-          "\"location\":\"%s\",\"message\":\"%s\",\"data\":%s,\"timestamp\":%lld}\n",
-          hypothesis_id, location, message, data_json ? data_json : "{}", ms);
-  fclose(f);
-}
-/* #endregion */
 
 /*
  * Boot path after absorb: 6677-boot starts server only; loader may be missing
@@ -52,17 +29,8 @@ static void debug_aa8e5b_log(const char *hypothesis_id, const char *location,
 static void ensure_usb_tether_daemon(void) {
   int running;
 
-  /* #region agent log */
-  debug_aa8e5b_log("C", "main.c:ensure_usb_tether_daemon", "enter",
-                   "{\"path\":\"/home/root/usb-tether.sh\"}");
-  /* #endregion */
-
   if (access("/home/root/usb-tether.sh", F_OK) != 0) {
     fprintf(stderr, "警告: /home/root/usb-tether.sh 缺失，跳过 USB DHCP\n");
-    /* #region agent log */
-    debug_aa8e5b_log("C", "main.c:ensure_usb_tether_daemon", "missing script",
-                     "{\"action\":\"skip\"}");
-    /* #endregion */
     return;
   }
 
@@ -71,10 +39,6 @@ static void ensure_usb_tether_daemon(void) {
   running = (system("ps | grep '[u]sb-tether' >/dev/null 2>&1") == 0);
   if (running) {
     printf("[boot] usb-tether already running\n");
-    /* #region agent log */
-    debug_aa8e5b_log("C", "main.c:ensure_usb_tether_daemon", "already running",
-                     "{\"action\":\"noop\"}");
-    /* #endregion */
     return;
   }
 
@@ -83,17 +47,9 @@ static void ensure_usb_tether_daemon(void) {
   if (system("setsid /home/root/usb-tether.sh >> /tmp/usb-tether.log 2>&1 &") !=
       0) {
     fprintf(stderr, "警告: 启动 usb-tether.sh 失败\n");
-    /* #region agent log */
-    debug_aa8e5b_log("C", "main.c:ensure_usb_tether_daemon", "spawn failed",
-                     "{\"action\":\"error\"}");
-    /* #endregion */
     return;
   }
   printf("[boot] usb-tether started\n");
-  /* #region agent log */
-  debug_aa8e5b_log("C", "main.c:ensure_usb_tether_daemon", "spawned",
-                   "{\"action\":\"setsid\"}");
-  /* #endregion */
 }
 
 #define SERVER_HOME "/home/root/6677"
@@ -121,23 +77,10 @@ int main(int argc, char *argv[]) {
     snprintf(cwd_before, sizeof(cwd_before), "?");
   if (chdir(SERVER_HOME) != 0) {
     fprintf(stderr, "警告: chdir %s 失败: 静态页/DB 可能不可用\n", SERVER_HOME);
-    /* #region agent log */
-    debug_aa8e5b_log("H", "main.c:chdir", "chdir failed",
-                     "{\"path\":\"/home/root/6677\"}");
-    /* #endregion */
   } else {
     if (getcwd(cwd_after, sizeof(cwd_after)) == NULL)
       snprintf(cwd_after, sizeof(cwd_after), SERVER_HOME);
     printf("[boot] cwd %s -> %s\n", cwd_before, cwd_after);
-    /* #region agent log */
-    {
-      char data[320];
-      snprintf(data, sizeof(data),
-               "{\"before\":\"%s\",\"after\":\"%s\",\"port\":\"%s\"}", cwd_before,
-               cwd_after, port);
-      debug_aa8e5b_log("H", "main.c:chdir", "chdir ok", data);
-    }
-    /* #endregion */
   }
 
   /* 同步系统时间：镜像无 ntpdate，用 ntpd one-shot */

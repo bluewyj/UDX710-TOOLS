@@ -1024,28 +1024,6 @@ void handle_set_system_time(struct mg_connection *c,
     }
   }
 
-  /* #region agent log */
-  {
-    FILE *dbg;
-    struct timespec ts;
-    long long ms;
-    mkdir("/mnt/data/logs", 0755);
-    dbg = fopen("/mnt/data/logs/debug-aa8e5b.log", "a");
-    if (dbg) {
-      clock_gettime(CLOCK_REALTIME, &ts);
-      ms = (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
-      fprintf(dbg,
-              "{\"sessionId\":\"aa8e5b\",\"runId\":\"post-fix-ntp\","
-              "\"hypothesisId\":\"N1\",\"location\":\"handlers.c:set/time\","
-              "\"message\":\"%s\",\"data\":{\"server\":\"%s\",\"out_snip\":"
-              "\"%.120s\"},\"timestamp\":%lld}\n",
-              success ? "ntp sync ok" : "ntp sync fail",
-              used_server ? used_server : "", output, ms);
-      fclose(dbg);
-    }
-  }
-  /* #endregion */
-
   JsonBuilder *j = json_new();
   json_obj_open(j);
   if (success) {
