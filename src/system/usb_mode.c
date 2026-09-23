@@ -256,6 +256,39 @@ static int read_sysfs(const char *path, char *buf, size_t size) {
     return 0;
 }
 
+/* 对齐 device_dump/home_root/fix-rndis-link.sh */
+static int usb_mode_ensure_rndis_descriptors(void) {
+    char class_path[256], sub_path[256], proto_path[256], qmult_path[256];
+    char cur[16];
+    snprintf(class_path, sizeof(class_path), "%s/rndis.gs4/class", USB_FUNCTIONS_PATH);
+    snprintf(sub_path, sizeof(sub_path), "%s/rndis.gs4/subclass", USB_FUNCTIONS_PATH);
+    snprintf(proto_path, sizeof(proto_path), "%s/rndis.gs4/protocol", USB_FUNCTIONS_PATH);
+    snprintf(qmult_path, sizeof(qmult_path), "%s/rndis.gs4/qmult", USB_FUNCTIONS_PATH);
+    if (access(class_path, F_OK) != 0) {
+        printf("[usb_mode] rndis.gs4 not ready, skip class fix\n");
+        return 0;
+    }
+    if (read_sysfs(class_path, cur, sizeof(cur)) == 0 && strcmp(cur, "ef") == 0) {
+        char sub[8] = {0}, proto[8] = {0};
+        read_sysfs(sub_path, sub, sizeof(sub));
+        read_sysfs(proto_path, proto, sizeof(proto));
+        if (strcmp(sub, "04") == 0 && strcmp(proto, "01") == 0)
+            return 0; /* already correct */
+    }
+    printf("[usb_mode] force rndis class ef/04/01\n");
+    if (write_sysfs(class_path, "ef") != 0 ||
+        write_sysfs(sub_path, "04") != 0 ||
+        write_sysfs(proto_path, "01") != 0) {
+        printf("[usb_mode] ERROR: failed to write rndis class/subclass/protocol\n");
+        return -1;
+    }
+    (void)write_sysfs(qmult_path, "5");
+    if (access(PAMU3_PROTOCOL_PATH, F_OK) == 0)
+        (void)write_sysfs(PAMU3_PROTOCOL_PATH, "RNDIS");
+    (void)write_sysfs("/sys/devices/platform/soc/soc:ipa/2b300000.pamu3/max_dl_pkts", "7");
+    return 0;
+}
+
 /* 执行系统命令 */
 static int run_cmd(const char *cmd) {
     printf("[usb_mode] 执行: %s\n", cmd);
@@ -579,6 +612,13 @@ int usb_mode_switch_advanced(int mode) {
     
     /* 14. 设置日志传输 */
     write_sysfs("/sys/module/slog_bridge/parameters/log_transport", "1");
+    
+    /* 14b. RNDIS: force class ef/04/01 before UDC bind */
+    if (mode == USB_MODE_RNDIS) {
+        int ret = usb_mode_ensure_rndis_descriptors();
+        if (ret != 0)
+            return ret;
+    }
     
     /* 15. 启用 UDC */
     write_sysfs(USB_UDC_PATH, udc_name);
