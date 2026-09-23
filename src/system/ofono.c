@@ -806,11 +806,36 @@ int ofono_get_data_status(int *active) {
   return ret;
 }
 
-int ofono_set_data_status(int active) {
+#define USER_DATA_OFF_PATH "/mnt/data/user_data_off"
+
+int ofono_user_data_disabled(void) {
+  return access(USER_DATA_OFF_PATH, F_OK) == 0 ? 1 : 0;
+}
+
+static int user_data_off_persist(int disabled) {
+  if (disabled) {
+    FILE *f = fopen(USER_DATA_OFF_PATH, "w");
+    if (!f)
+      return -1;
+    fputs("1\n", f);
+    fclose(f);
+    return 0;
+  }
+  unlink(USER_DATA_OFF_PATH);
+  return 0;
+}
+
+int ofono_set_data_status_ex(int active, int user_request) {
   GError *error = NULL;
   GVariant *result = NULL;
   GDBusProxy *proxy = NULL;
   char context_path[256] = {0};
+
+  /* 内部激活不得覆盖用户关闭意图 */
+  if (!user_request && active && ofono_user_data_disabled()) {
+    printf("[Data] skip activate — user_data_off set\n");
+    return -4;
+  }
 
   if (!ensure_connection()) {
     return -1;
@@ -849,6 +874,12 @@ int ofono_set_data_status(int active) {
   g_variant_unref(result);
   g_object_unref(proxy);
 
+  if (user_request) {
+    if (user_data_off_persist(active ? 0 : 1) != 0) {
+      printf("[Data] warn: failed to persist user_data_off=%d\n", active ? 0 : 1);
+    }
+  }
+
   /* 根据数据连接状态控制监听 */
   if (active) {
     /* 开启数据连接时启动监听 */
@@ -863,6 +894,10 @@ int ofono_set_data_status(int active) {
   }
 
   return 0;
+}
+
+int ofono_set_data_status(int active) {
+  return ofono_set_data_status_ex(active, 0);
 }
 
 int ofono_get_roaming_status(int *roaming_allowed, int *is_roaming) {
@@ -1646,10 +1681,14 @@ int ofono_probe_connectivity(OfonoConnectivityProbe *out) {
 }
 
 int ofono_bounce_pdp_context(void) {
-  (void)ofono_set_data_status(0);
+  if (ofono_user_data_disabled()) {
+    printf("[DataRestore] bounce skipped — user_data_off\n");
+    return -1;
+  }
+  (void)ofono_set_data_status_ex(0, 0);
   /* ofono lock released during bounce wait */
   sleep(4);
-  if (ofono_set_data_status(1) != 0) {
+  if (ofono_set_data_status_ex(1, 0) != 0) {
     return -1;
   }
   int active = 0;
@@ -1689,6 +1728,12 @@ int ofono_check_and_restore_data(char *result, int size) {
 
   if (!result || size <= 0) {
     return -1;
+  }
+
+  /* 0. 用户显式关闭移动数据：跳过自动恢复（user_data_off skip restore） */
+  if (ofono_user_data_disabled()) {
+    snprintf(result, size, "用户已关闭移动数据，跳过自动恢复");
+    return 0;
   }
 
   /* 1. 检查网络注册状态 */

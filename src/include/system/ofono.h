@@ -119,6 +119,15 @@ int ofono_get_data_status(int *active);
 int ofono_set_data_status(int active);
 
 /**
+ * 设置数据连接；user_request=1 表示来自用户 API（写/清 /mnt/data/user_data_off）
+ * user_request=0 为内部自愈/bounce/APN，不得污染用户关闭意图；若用户已关闭则拒绝激活
+ */
+int ofono_set_data_status_ex(int active, int user_request);
+
+/** 用户是否已显式关闭移动数据（持久标志存在） */
+int ofono_user_data_disabled(void);
+
+/**
  * 获取漫游状态
  * @param roaming_allowed 输出漫游允许状态 (1=允许, 0=禁止)
  * @param is_roaming 输出当前是否漫游中 (1=漫游中, 0=非漫游)
@@ -249,8 +258,9 @@ int ofono_bounce_pdp(void);
 
 /**
  * 检查并恢复数据连接
+ * - 用户已显式关闭移动数据 → 跳过激活（不报失败）
  * - APN 已配置且 Active=false → 尝试激活
- * - Active=true 但公网 ICMP 不可达 → bounce PDP（false→true），冷却 90s
+ * - Active=true 但公网 ICMP 不可达 → 由 watchdog streak 触发 bounce（本函数不立即 bounce）
  * @param result 输出结果描述字符串
  * @param size 缓冲区大小
  * @return 成功返回0，失败返回错误码

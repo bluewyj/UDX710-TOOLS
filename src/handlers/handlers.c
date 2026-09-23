@@ -1054,6 +1054,7 @@ void handle_data_status(struct mg_connection *c, struct mg_http_message *hm) {
       json_add_str(j, "message", "Success");
       json_key_obj_open(j, "data");
       json_add_bool(j, "active", active);
+      json_add_bool(j, "user_disabled", ofono_user_data_disabled());
       json_obj_close(j);
       json_obj_close(j);
       HTTP_OK_FREE(c, json_finish(j));
@@ -1062,7 +1063,7 @@ void handle_data_status(struct mg_connection *c, struct mg_http_message *hm) {
                  "connection status\"}");
     }
   } else if (hm->method.len == 4 && memcmp(hm->method.buf, "POST", 4) == 0) {
-    /* POST - 设置数据连接状态 */
+    /* POST - 设置数据连接状态（用户意图） */
     int active = 0;
     int val = 0;
     if (mg_json_get_bool(hm->body, "$.active", &val)) {
@@ -1072,7 +1073,7 @@ void handle_data_status(struct mg_connection *c, struct mg_http_message *hm) {
       return;
     }
 
-    if (ofono_set_data_status(active) == 0) {
+    if (ofono_set_data_status_ex(active, 1) == 0) {
       JsonBuilder *j = json_new();
       json_obj_open(j);
       json_add_str(j, "status", "ok");
@@ -1082,6 +1083,7 @@ void handle_data_status(struct mg_connection *c, struct mg_http_message *hm) {
       json_add_str(j, "message", msg);
       json_key_obj_open(j, "data");
       json_add_bool(j, "active", active);
+      json_add_bool(j, "user_disabled", ofono_user_data_disabled());
       json_obj_close(j);
       json_obj_close(j);
       HTTP_OK_FREE(c, json_finish(j));
