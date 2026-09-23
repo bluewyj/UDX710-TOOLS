@@ -1,6 +1,6 @@
 /**
  * @file ipv6_tether.c
- * @brief USB0 IPv6 NAT66 + ULA + periodic RA for Windows SLAAC
+ * @brief USB0 IPv6 NAT66 + 合成全局前缀 + periodic RA (含 RDNSS)
  */
 
 #include "ipv6_tether.h"
@@ -15,9 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
 #include <sys/wait.h>
-#include <time.h>
 #include <unistd.h>
 
 #define USB_IFACE "usb0"
@@ -27,27 +25,6 @@
 static pthread_t g_ra_tid;
 static volatile int g_ra_running;
 static int g_started;
-
-/* #region agent log */
-static void dbg_log(const char *hid, const char *loc, const char *msg,
-                    const char *data_json) {
-  FILE *f;
-  struct timespec ts;
-  long long ms;
-
-  mkdir("/mnt/data/logs", 0755);
-  f = fopen("/mnt/data/logs/debug-aa8e5b.log", "a");
-  if (!f)
-    return;
-  clock_gettime(CLOCK_REALTIME, &ts);
-  ms = (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
-  fprintf(f,
-          "{\"sessionId\":\"aa8e5b\",\"runId\":\"ipv6-fix\",\"hypothesisId\":\"%s\","
-          "\"location\":\"%s\",\"message\":\"%s\",\"data\":%s,\"timestamp\":%lld}\n",
-          hid, loc, msg, data_json ? data_json : "{}", ms);
-  fclose(f);
-}
-/* #endregion */
 
 static int write_proc(const char *path, const char *val) {
   FILE *f = fopen(path, "w");
@@ -131,8 +108,7 @@ struct ra_pkt {
 #define ND_OPT_RDNSS 25
 #endif
 
-/* Public recursive DNS so Windows NCSI/IPv6 name resolve works without
- * carrier DNS on the ULA path (NAT66). Prefer AliDNS then Google. */
+/* Public recursive DNS so Windows NCSI/IPv6 name resolve works on NAT66 path */
 static const char *k_rdnss1 = "2400:3200::1";
 static const char *k_rdnss2 = "2001:4860:4860::8888";
 
@@ -206,29 +182,13 @@ static int send_one_ra(int ifindex) {
 }
 
 static void *ra_thread(void *arg) {
-  unsigned ifindex = if_nametoindex(USB_IFACE);
-  int ok = 0;
-  int sent_logs = 0;
+  unsigned ifindex;
   (void)arg;
-
-  /* #region agent log */
-  dbg_log("H3", "ipv6_tether.c:ra_thread", "ra thread start",
-          ifindex ? "{\"if\":\"usb0\"}" : "{\"if\":\"missing\"}");
-  /* #endregion */
 
   while (g_ra_running) {
     ifindex = if_nametoindex(USB_IFACE);
-    if (ifindex != 0) {
-      ok = (send_one_ra((int)ifindex) == 0);
-      /* #region agent log */
-      if (sent_logs < 3) {
-        char data[80];
-        snprintf(data, sizeof(data), "{\"ok\":%d,\"ifindex\":%u}", ok, ifindex);
-        dbg_log("H3", "ipv6_tether.c:ra_send", "ra sent", data);
-        sent_logs++;
-      }
-      /* #endregion */
-    }
+    if (ifindex != 0)
+      (void)send_one_ra((int)ifindex);
     sleep(RA_INTERVAL_SEC);
   }
   return NULL;
@@ -237,16 +197,11 @@ static void *ra_thread(void *arg) {
 int ipv6_tether_ensure(void) {
   const char *uplink;
   char cmd[256];
-  char data[160];
   unsigned ifindex;
 
   ifindex = if_nametoindex(USB_IFACE);
-  if (ifindex == 0) {
-    /* #region agent log */
-    dbg_log("H3", "ipv6_tether.c:ensure", "usb0 missing", "{}");
-    /* #endregion */
+  if (ifindex == 0)
     return -1;
-  }
 
   uplink = pick_uplink();
 
@@ -258,29 +213,14 @@ int ipv6_tether_ensure(void) {
 
   snprintf(cmd, sizeof(cmd), "ip -6 addr replace %s/%d dev %s",
            IPV6_TETHER_LAN_GW, IPV6_TETHER_LAN_PLEN, USB_IFACE);
-  if (run_sh(cmd) != 0) {
-    /* #region agent log */
-    dbg_log("H-ULA", "ipv6_tether.c:ensure", "lan prefix add fail", "{}");
-    /* #endregion */
+  if (run_sh(cmd) != 0)
     return -1;
-  }
 
-  /* 清掉旧 ULA，避免 PC 仍挂 fd66 */
+  /* 清掉旧 ULA，避免 PC 仍挂 fd66（Win NLA 会判 LocalNetwork） */
   (void)run_sh("ip -6 addr del fd66:6677::1/64 dev usb0 2>/dev/null || true");
 
-  if (apply_nat66(uplink) != 0) {
-    /* #region agent log */
-    dbg_log("H-ULA", "ipv6_tether.c:ensure", "nat66 fail", "{}");
-    /* #endregion */
+  if (apply_nat66(uplink) != 0)
     return -1;
-  }
-
-  /* #region agent log */
-  snprintf(data, sizeof(data),
-           "{\"uplink\":\"%s\",\"gw\":\"%s\",\"forwarding\":1,\"rdnss\":1}",
-           uplink, IPV6_TETHER_LAN_GW);
-  dbg_log("H-ULA", "ipv6_tether.c:ensure", "nat66+global-prefix ok", data);
-  /* #endregion */
 
   if (!g_started) {
     g_ra_running = 1;
@@ -289,14 +229,10 @@ int ipv6_tether_ensure(void) {
       g_started = 1;
     } else {
       g_ra_running = 0;
-      /* #region agent log */
-      dbg_log("H3", "ipv6_tether.c:ensure", "ra thread fail", "{}");
-      /* #endregion */
       return -1;
     }
   }
 
-  /* 立即立刻发一次 RA */
   (void)send_one_ra((int)ifindex);
   printf("[boot] ipv6 tether ensured (LAN %s via %s)\n", IPV6_TETHER_LAN_GW,
          uplink);
