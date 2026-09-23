@@ -2168,8 +2168,7 @@ static void outage_watchdog_tick(void) {
         else if (br == 0)
           g_partial_bounce_count++;
       } else if (g_partial_bounce_retry_pending &&
-                 g_partial_streak >= PARTIAL_BOUNCE_STREAK &&
-                 g_partial_streak < PARTIAL_REBOOT_STREAK) {
+                 g_partial_streak == PARTIAL_BOUNCE_RETRY) {
         int br = ofono_bounce_pdp();
         if (br != -2) {
           g_partial_bounce_count++;
