@@ -924,6 +924,15 @@ static int apn_boot_activate_pdp_fallback(void) {
     return apn_boot_is_active() ? 0 : -1;
 }
 
+static void apn_boot_disconnect_context(void) {
+    char out[256];
+    /* Best-effort: disconnect active connman cellular service if present */
+    (void)run_command(out, sizeof(out), "sh", "-c",
+        "svc=$(connmanctl services 2>/dev/null | awk '/cellular/ {print $NF; exit}'); "
+        "[ -n \"$svc\" ] && connmanctl disconnect \"$svc\"",
+        NULL);
+}
+
 static void apn_boot_touch_tether_refresh(void) {
     FILE *fp = fopen("/tmp/usb-tether-refresh", "w");
     if (fp) {
@@ -935,6 +944,8 @@ static int apn_boot_apply_full(const ApnBootTemplate *tpl) {
     ApnTemplate atpl;
     int active = 0;
     int i;
+    int attempt;
+    char msg[128];
 
     apn_boot_set_state("running");
     apn_boot_log_line("config ok, sleeping 20s");
@@ -973,24 +984,30 @@ static int apn_boot_apply_full(const ApnBootTemplate *tpl) {
         }
     }
 
-    memset(&atpl, 0, sizeof(atpl));
-    strncpy(atpl.apn, tpl->apn, sizeof(atpl.apn) - 1);
-    strncpy(atpl.protocol, tpl->proto, sizeof(atpl.protocol) - 1);
-    strncpy(atpl.username, tpl->user, sizeof(atpl.username) - 1);
-    strncpy(atpl.password, tpl->pass, sizeof(atpl.password) - 1);
-    strncpy(atpl.auth_method, tpl->auth, sizeof(atpl.auth_method) - 1);
+    for (attempt = 1; attempt <= 3; attempt++) {
+        snprintf(msg, sizeof(msg), "apply attempt=%d", attempt);
+        apn_boot_log_line(msg);
+        apn_boot_disconnect_context();
 
-    if (apply_apn_to_ofono(&atpl) != 0) {
-        apn_boot_set_state("failed");
-        return -1;
-    }
+        memset(&atpl, 0, sizeof(atpl));
+        strncpy(atpl.apn, tpl->apn, sizeof(atpl.apn) - 1);
+        strncpy(atpl.protocol, tpl->proto, sizeof(atpl.protocol) - 1);
+        strncpy(atpl.username, tpl->user, sizeof(atpl.username) - 1);
+        strncpy(atpl.password, tpl->pass, sizeof(atpl.password) - 1);
+        strncpy(atpl.auth_method, tpl->auth, sizeof(atpl.auth_method) - 1);
 
-    ofono_set_data_status(1);
-    sleep(8);
-    if (ofono_get_data_status(&active) == 0 && active) {
-        apn_boot_set_state("activated");
-        apn_boot_touch_tether_refresh();
-        return 0;
+        if (apply_apn_to_ofono(&atpl) != 0) {
+            apn_boot_log_line("dbus apply skipped or failed");
+            continue;
+        }
+
+        ofono_set_data_status(1);
+        sleep(8);
+        if (ofono_get_data_status(&active) == 0 && active) {
+            apn_boot_set_state("activated");
+            apn_boot_touch_tether_refresh();
+            return 0;
+        }
     }
 
     apn_boot_set_state("failed");
