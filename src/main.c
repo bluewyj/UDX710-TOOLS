@@ -12,6 +12,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 static void *ofono_usb_share_at_thread(void *arg) {
   (void)arg;
@@ -20,12 +23,88 @@ static void *ofono_usb_share_at_thread(void *arg) {
   return NULL;
 }
 
-int main(int argc, char *argv[]) {
-  const char *port = "6677";
+/* #region agent log */
+static void debug_aa8e5b_log(const char *hypothesis_id, const char *location,
+                             const char *message, const char *data_json) {
+  FILE *f;
+  struct timespec ts;
+  long long ms;
 
-  /* 解析命令行参数 */
-  if (argc > 1) {
-    port = argv[1];
+  mkdir("/mnt/data/logs", 0755);
+  f = fopen("/mnt/data/logs/debug-aa8e5b.log", "a");
+  if (!f)
+    return;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  ms = (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+  fprintf(f,
+          "{\"sessionId\":\"aa8e5b\",\"runId\":\"post-fix\",\"hypothesisId\":\"%s\","
+          "\"location\":\"%s\",\"message\":\"%s\",\"data\":%s,\"timestamp\":%lld}\n",
+          hypothesis_id, location, message, data_json ? data_json : "{}", ms);
+  fclose(f);
+}
+/* #endregion */
+
+/*
+ * Boot path after absorb: 6677-boot starts server only; loader may be missing
+ * or non-executable. Outage/APN code only touches tether refresh flags — so
+ * ensure usb-tether.sh itself is running or PC never gets 192.168.66.x.
+ */
+static void ensure_usb_tether_daemon(void) {
+  int running;
+
+  /* #region agent log */
+  debug_aa8e5b_log("C", "main.c:ensure_usb_tether_daemon", "enter",
+                   "{\"path\":\"/home/root/usb-tether.sh\"}");
+  /* #endregion */
+
+  if (access("/home/root/usb-tether.sh", F_OK) != 0) {
+    fprintf(stderr, "警告: /home/root/usb-tether.sh 缺失，跳过 USB DHCP\n");
+    /* #region agent log */
+    debug_aa8e5b_log("C", "main.c:ensure_usb_tether_daemon", "missing script",
+                     "{\"action\":\"skip\"}");
+    /* #endregion */
+    return;
+  }
+
+  (void)system("chmod 755 /home/root/usb-tether.sh 2>/dev/null");
+
+  running = (system("ps | grep '[u]sb-tether' >/dev/null 2>&1") == 0);
+  if (running) {
+    printf("[boot] usb-tether already running\n");
+    /* #region agent log */
+    debug_aa8e5b_log("C", "main.c:ensure_usb_tether_daemon", "already running",
+                     "{\"action\":\"noop\"}");
+    /* #endregion */
+    return;
+  }
+
+  /* Clear stale pid so tether's own lock does not no-op after crash */
+  (void)system("rm -f /tmp/usb-tether.pid 2>/dev/null");
+  if (system("setsid /home/root/usb-tether.sh >> /tmp/usb-tether.log 2>&1 &") !=
+      0) {
+    fprintf(stderr, "警告: 启动 usb-tether.sh 失败\n");
+    /* #region agent log */
+    debug_aa8e5b_log("C", "main.c:ensure_usb_tether_daemon", "spawn failed",
+                     "{\"action\":\"error\"}");
+    /* #endregion */
+    return;
+  }
+  printf("[boot] usb-tether started\n");
+  /* #region agent log */
+  debug_aa8e5b_log("C", "main.c:ensure_usb_tether_daemon", "spawned",
+                   "{\"action\":\"setsid\"}");
+  /* #endregion */
+}
+
+int main(int argc, char *argv[]) {
+  const char *port = "80";
+
+  /* 解析命令行参数：init 曾传字面量 "boot"（非端口），映射到生产端口 80 */
+  if (argc > 1 && argv[1] && argv[1][0] != '\0') {
+    if (strcmp(argv[1], "boot") == 0)
+      port = "80";
+    else
+      port = argv[1];
   }
 
   printf("=== ofono-server (C version) ===\n");
@@ -68,6 +147,9 @@ int main(int argc, char *argv[]) {
   if (usb_mode_ensure_rndis_link() != 0) {
     fprintf(stderr, "警告: usb_mode_ensure_rndis_link 失败\n");
   }
+
+  /* RNDIS DHCP：保证 usb-tether 守护进程在跑（不依赖 loader cron） */
+  ensure_usb_tether_daemon();
 
   /* 启动 HTTP 服务器 */
   if (http_server_start(port) != 0) {
