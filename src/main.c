@@ -6,6 +6,7 @@
 #include "http_server.h"
 #include "netif.h"
 #include "ofono.h"
+#include "platform_setup.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +40,11 @@ int main(int argc, char *argv[]) {
   printf("启动数据连接 Watchdog (60s)...\n");
   if (ofono_start_data_watchdog(60) != 0) {
     fprintf(stderr, "警告: 数据连接 Watchdog 启动失败\n");
+  }
+
+  /* 首启幂等写入 platform USB/APN 配置文件 */
+  if (platform_setup_ensure() != 0) {
+    fprintf(stderr, "警告: platform_setup_ensure 失败\n");
   }
 
   /* 启动 HTTP 服务器 */
