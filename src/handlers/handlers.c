@@ -20,6 +20,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
 
 /* GET /api/info - 获取系统信息 */
 void handle_info(struct mg_connection *c, struct mg_http_message *hm) {
@@ -976,27 +978,73 @@ void handle_get_system_time(struct mg_connection *c,
   HTTP_OK_FREE(c, json_finish(j));
 }
 
-/* POST /api/set/time - NTP同步系统时间 */
+/* POST /api/set/time - NTP同步系统时间
+ * 设备镜像无 ntpdate，仅有 ISC ntpd；用 ntpd -gq 一次性校正。
+ */
+static int ntp_sync_with_server(char *output, size_t size, const char *server) {
+  char cmd[384];
+
+  if (access("/usr/sbin/ntpdate", X_OK) == 0 ||
+      access("/usr/bin/ntpdate", X_OK) == 0) {
+    if (run_command(output, size, "ntpdate", "-u", server, NULL) == 0)
+      return 0;
+  }
+
+  /* 停掉常驻 ntpd 后 one-shot，再拉起 init 脚本 */
+  snprintf(cmd, sizeof(cmd),
+           "killall ntpd 2>/dev/null; "
+           "/usr/sbin/ntpd -gq -x -4 %s; "
+           "r=$?; "
+           "if [ -x /etc/init.d/ntpd ]; then /etc/init.d/ntpd start >/dev/null "
+           "2>&1; "
+           "else /usr/sbin/ntpd -u ntp:ntp -p /var/run/ntpd.pid -g "
+           ">/dev/null 2>&1; fi; "
+           "exit $r",
+           server);
+  return run_command(output, size, "sh", "-c", cmd, NULL);
+}
+
 void handle_set_system_time(struct mg_connection *c,
                             struct mg_http_message *hm) {
   HTTP_CHECK_POST(c, hm);
 
-  char output[512];
-
-  const char *ntp_servers[] = {"ntp.aliyun.com", "pool.ntp.org",
-                               "time.windows.com", NULL};
-
+  char output[1024];
+  const char *ntp_servers[] = {"ntp.aliyun.com", "ntp.tencent.com",
+                               "pool.ntp.org", NULL};
   int success = 0;
   const char *used_server = NULL;
+  int i;
 
-  for (int i = 0; ntp_servers[i] != NULL; i++) {
-    if (run_command(output, sizeof(output), "ntpdate", ntp_servers[i], NULL) ==
-        0) {
+  for (i = 0; ntp_servers[i] != NULL; i++) {
+    memset(output, 0, sizeof(output));
+    if (ntp_sync_with_server(output, sizeof(output), ntp_servers[i]) == 0) {
       success = 1;
       used_server = ntp_servers[i];
       break;
     }
   }
+
+  /* #region agent log */
+  {
+    FILE *dbg;
+    struct timespec ts;
+    long long ms;
+    mkdir("/mnt/data/logs", 0755);
+    dbg = fopen("/mnt/data/logs/debug-aa8e5b.log", "a");
+    if (dbg) {
+      clock_gettime(CLOCK_REALTIME, &ts);
+      ms = (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+      fprintf(dbg,
+              "{\"sessionId\":\"aa8e5b\",\"runId\":\"post-fix-ntp\","
+              "\"hypothesisId\":\"N1\",\"location\":\"handlers.c:set/time\","
+              "\"message\":\"%s\",\"data\":{\"server\":\"%s\",\"out_snip\":"
+              "\"%.120s\"},\"timestamp\":%lld}\n",
+              success ? "ntp sync ok" : "ntp sync fail",
+              used_server ? used_server : "", output, ms);
+      fclose(dbg);
+    }
+  }
+  /* #endregion */
 
   JsonBuilder *j = json_new();
   json_obj_open(j);

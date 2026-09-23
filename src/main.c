@@ -140,8 +140,9 @@ int main(int argc, char *argv[]) {
     /* #endregion */
   }
 
-  /* 同步系统时间 */
-  system("ntpdate ntp.aliyun.com > /dev/null 2>&1 &");
+  /* 同步系统时间：镜像无 ntpdate，用 ntpd one-shot */
+  system("killall ntpd 2>/dev/null; /usr/sbin/ntpd -gq -x >/dev/null 2>&1; "
+         "/etc/init.d/ntpd start >/dev/null 2>&1 &");
 
   /* 初始化 ofono D-Bus 连接 */
   if (!ofono_init()) {
