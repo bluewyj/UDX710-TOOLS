@@ -1441,6 +1441,10 @@ int ofono_get_serving_cell_info(char *tech, int tech_size, int *band) {
 #define OUTAGE_REBOOT_DAY_FILE     "/mnt/data/outage-watch-reboot-day"
 #define OUTAGE_REBOOT_PENDING_FILE "/mnt/data/outage-watch-reboot-pending"
 #define OUTAGE_PARTIAL_GRACE_FILE  "/mnt/data/outage-watch-partial-grace"
+#define NR_LTE_SWITCH_ON_FILE      "/mnt/data/nr-lte-switch.on"
+#define NR_LTE_BOOT_GRACE_S            300
+#define NR_LTE_TICK_INTERVAL_S          60
+#define NR_LTE_PHASE1_MAX_SWITCHES       3
 
 static pthread_t g_watchdog_thread = 0;
 static volatile int g_watchdog_running = 0;
@@ -1451,6 +1455,13 @@ static int g_partial_streak = 0;
 static int g_total_streak = 0;
 static int g_partial_bounce_count = 0;
 static int g_partial_bounce_retry_pending = 0;
+static int g_nr_lte_phase = 1;
+static int g_nr_lte_switch_count = 0;
+static int g_nr_lte_cooldown = 0;
+static int g_nr_lte_cooldown_counter = 0;
+static int g_nr_lte_nr_streak = 0;
+static int g_nr_lte_last_switch = 0;
+static time_t g_nr_lte_last_tick_ts = 0;
 
 /**
  * 获取网络注册状态
@@ -1690,6 +1701,149 @@ static int outage_dhcp_ok(void) {
 static int outage_cell_active(void) {
   int active = 0;
   return ofono_get_data_status(&active) == 0 && active;
+}
+
+static int nr_lte_uptime_sec(void) {
+  FILE *f = fopen("/proc/uptime", "r");
+  if (!f)
+    return -1;
+  double up = 0;
+  if (fscanf(f, "%lf", &up) != 1) {
+    fclose(f);
+    return -1;
+  }
+  fclose(f);
+  return (int)up;
+}
+
+static int nr_lte_get_registration_technology(char *tech, size_t size) {
+  GError *error = NULL;
+  GVariant *result = NULL;
+  GDBusProxy *proxy = NULL;
+  int ret = -1;
+
+  if (!tech || size == 0 || !ensure_connection())
+    return -1;
+
+  tech[0] = '\0';
+
+  proxy = g_dbus_proxy_new_sync(g_dbus_conn, G_DBUS_PROXY_FLAGS_NONE, NULL,
+                                OFONO_SERVICE, get_current_modem_path(),
+                                OFONO_NETWORK_REGISTRATION, NULL, &error);
+  if (!proxy) {
+    if (error)
+      g_error_free(error);
+    return -2;
+  }
+
+  result = g_dbus_proxy_call_sync(proxy, "GetProperties", NULL,
+                                  G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS,
+                                  NULL, &error);
+  if (!result) {
+    if (error)
+      g_error_free(error);
+    g_object_unref(proxy);
+    return -3;
+  }
+
+  GVariant *props = g_variant_get_child_value(result, 0);
+  if (props) {
+    GVariant *v =
+        g_variant_lookup_value(props, "Technology", G_VARIANT_TYPE_STRING);
+    if (v) {
+      const gchar *tech_str = g_variant_get_string(v, NULL);
+      if (tech_str) {
+        strncpy(tech, tech_str, size - 1);
+        tech[size - 1] = '\0';
+        ret = 0;
+      }
+      g_variant_unref(v);
+    }
+    g_variant_unref(props);
+  }
+
+  g_variant_unref(result);
+  g_object_unref(proxy);
+  return ret;
+}
+
+static void nr_lte_apply_nr_preference(void) {
+  const char *modem = get_current_modem_path();
+  printf("[NrLteSwitch] TechnologyPreference: NR 5G only -> NR 5G/LTE auto\n");
+  (void)ofono_network_set_mode_sync(modem, 8, OFONO_TIMEOUT_MS);
+  (void)ofono_network_set_mode_sync(modem, 9, OFONO_TIMEOUT_MS);
+}
+
+static void nr_lte_reset_phase1(void) {
+  g_nr_lte_phase = 1;
+  g_nr_lte_switch_count = 0;
+  g_nr_lte_cooldown = 0;
+  g_nr_lte_cooldown_counter = 0;
+  g_nr_lte_nr_streak = 0;
+  g_nr_lte_last_switch = 0;
+}
+
+static void nr_lte_switch_tick(void) {
+  if (access(NR_LTE_SWITCH_ON_FILE, F_OK) != 0)
+    return;
+
+  int up = nr_lte_uptime_sec();
+  if (up >= 0 && up < NR_LTE_BOOT_GRACE_S)
+    return;
+
+  char tech[32];
+  if (nr_lte_get_registration_technology(tech, sizeof(tech)) != 0 ||
+      tech[0] == '\0')
+    return;
+
+  if (strcmp(tech, "NR") == 0) {
+    g_nr_lte_nr_streak++;
+    if (g_nr_lte_nr_streak >= 2) {
+      printf("[NrLteSwitch] consecutive NR -> reset phase 1\n");
+      nr_lte_reset_phase1();
+    }
+    return;
+  }
+
+  if (strcmp(tech, "LTE") != 0)
+    return;
+
+  g_nr_lte_nr_streak = 0;
+
+  if (outage_cell_active())
+    return;
+
+  if (g_nr_lte_phase == 1) {
+    if (g_nr_lte_switch_count < NR_LTE_PHASE1_MAX_SWITCHES) {
+      nr_lte_apply_nr_preference();
+      g_nr_lte_switch_count++;
+      printf("[NrLteSwitch] phase1 switch %d/%d\n", g_nr_lte_switch_count,
+             NR_LTE_PHASE1_MAX_SWITCHES);
+    } else {
+      g_nr_lte_phase = 2;
+      g_nr_lte_cooldown = 10;
+      g_nr_lte_cooldown_counter = g_nr_lte_cooldown;
+      g_nr_lte_last_switch = 0;
+      printf("[NrLteSwitch] phase1 exhausted -> phase2 cooldown=%d min\n",
+             g_nr_lte_cooldown);
+    }
+  } else if (g_nr_lte_cooldown_counter > 0) {
+    g_nr_lte_cooldown_counter--;
+    if (g_nr_lte_cooldown_counter == 0)
+      g_nr_lte_last_switch = 0;
+  } else if (g_nr_lte_last_switch == 0) {
+    nr_lte_apply_nr_preference();
+    g_nr_lte_last_switch = 1;
+  } else {
+    if (g_nr_lte_cooldown == 10)
+      g_nr_lte_cooldown = 30;
+    else
+      g_nr_lte_cooldown = 60;
+    g_nr_lte_cooldown_counter = g_nr_lte_cooldown;
+    g_nr_lte_last_switch = 0;
+    printf("[NrLteSwitch] phase2 cooldown escalate -> %d min\n",
+           g_nr_lte_cooldown);
+  }
 }
 
 static int outage_usb0_has_inet(void) {
@@ -2055,6 +2209,8 @@ static void *data_watchdog_thread(void *arg) {
   g_total_streak = 0;
   g_partial_bounce_count = 0;
   g_partial_bounce_retry_pending = 0;
+  nr_lte_reset_phase1();
+  g_nr_lte_last_tick_ts = 0;
   outage_commit_pending_reboot_budget();
 
   printf("[Watchdog] 数据连接监控线程已启动 (间隔: %d秒, PARTIAL bounce@%d/%d reboot@%d, TOTAL reboot@%d)\n",
@@ -2063,6 +2219,18 @@ static void *data_watchdog_thread(void *arg) {
 
   while (g_watchdog_running) {
     outage_watchdog_tick();
+
+    {
+      time_t nr_now = time(NULL);
+      if (nr_now != (time_t)-1) {
+        if (g_nr_lte_last_tick_ts == 0)
+          g_nr_lte_last_tick_ts = nr_now;
+        else if (nr_now >= g_nr_lte_last_tick_ts + NR_LTE_TICK_INTERVAL_S) {
+          g_nr_lte_last_tick_ts = nr_now;
+          nr_lte_switch_tick();
+        }
+      }
+    }
 
     if (ofono_check_and_restore_data(status, sizeof(status)) >= 0) {
       if (strcmp(status, g_last_watchdog_status) != 0) {
