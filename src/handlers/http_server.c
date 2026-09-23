@@ -61,6 +61,8 @@ static int is_auth_whitelist(const char *uri, const char *method,
   if (is_get) {
     if (strncmp(uri, "/api/info", 9) == 0)
       return 1;
+    if (strncmp(uri, "/api/connectivity", 17) == 0)
+      return 1;
     if (strncmp(uri, "/api/charge/config", 18) == 0)
       return 1;
     if (strncmp(uri, "/api/current_band", 17) == 0)
@@ -161,6 +163,8 @@ static void http_handler(struct mg_connection *c, int ev, void *ev_data) {
     /* API 路由 */
     if (mg_match(hm->uri, mg_str("/api/info"), NULL)) {
       handle_info(c, hm);
+    } else if (mg_match(hm->uri, mg_str("/api/connectivity"), NULL)) {
+      handle_connectivity(c, hm);
     } else if (mg_match(hm->uri, mg_str("/api/at"), NULL)) {
       handle_execute_at(c, hm);
     } else if (mg_match(hm->uri, mg_str("/api/set_network"), NULL)) {

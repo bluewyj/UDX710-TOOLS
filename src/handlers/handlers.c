@@ -1094,6 +1094,44 @@ void handle_data_status(struct mg_connection *c, struct mg_http_message *hm) {
   }
 }
 
+/* GET /api/connectivity - 双栈连通性探测（只读，不触发 bounce） */
+void handle_connectivity(struct mg_connection *c, struct mg_http_message *hm) {
+  HTTP_CHECK_GET(c, hm);
+
+  OfonoConnectivityProbe probe;
+  if (ofono_probe_connectivity(&probe) != 0) {
+    HTTP_ERROR(c, 500, "connectivity probe failed");
+    return;
+  }
+
+  JsonBuilder *j = json_new();
+  json_obj_open(j);
+  json_add_str(j, "status", "ok");
+  json_key_obj_open(j, "data");
+
+  json_key_obj_open(j, "ipv4");
+  json_add_bool(j, "success", probe.ipv4.success);
+  json_add_str(j, "target", probe.ipv4.target);
+  if (probe.ipv4.success)
+    json_add_double(j, "latency_ms", probe.ipv4.latency_ms);
+  else if (probe.ipv4.error[0])
+    json_add_str(j, "error", probe.ipv4.error);
+  json_obj_close(j);
+
+  json_key_obj_open(j, "ipv6");
+  json_add_bool(j, "success", probe.ipv6.success);
+  json_add_str(j, "target", probe.ipv6.target);
+  if (probe.ipv6.success)
+    json_add_double(j, "latency_ms", probe.ipv6.latency_ms);
+  else if (probe.ipv6.error[0])
+    json_add_str(j, "error", probe.ipv6.error);
+  json_obj_close(j);
+
+  json_obj_close(j); /* data */
+  json_obj_close(j); /* root */
+  HTTP_OK_FREE(c, json_finish(j));
+}
+
 /* GET/POST /api/roaming - 漫游开关 */
 void handle_roaming_status(struct mg_connection *c,
                            struct mg_http_message *hm) {
