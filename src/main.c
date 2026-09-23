@@ -4,6 +4,7 @@
  */
 
 #include "http_server.h"
+#include "ipv6_tether.h"
 #include "netif.h"
 #include "ofono.h"
 #include "platform_setup.h"
@@ -125,6 +126,11 @@ int main(int argc, char *argv[]) {
 
   /* RNDIS DHCP：保证 usb-tether 守护进程在跑（不依赖 loader cron） */
   ensure_usb_tether_daemon();
+
+  /* IPv6：运营商已给蜂窝全局地址；向 PC 做 NAT66+ULA+RA */
+  if (ipv6_tether_ensure() != 0) {
+    fprintf(stderr, "警告: ipv6_tether_ensure 失败（PC IPv6 可能不可用）\n");
+  }
 
   /* 启动 HTTP 服务器 */
   if (http_server_start(port) != 0) {
