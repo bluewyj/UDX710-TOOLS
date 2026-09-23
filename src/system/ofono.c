@@ -36,7 +36,10 @@ int ofono_is_data_monitor_running(void);
 /* ==================== 全局变量 ==================== */
 static GDBusConnection *g_dbus_conn = NULL;
 static GDBusProxy *g_modem_proxy = NULL;
-static pthread_mutex_t g_at_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_ofono_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void ofono_lock(void) { pthread_mutex_lock(&g_ofono_mutex); }
+static void ofono_unlock(void) { pthread_mutex_unlock(&g_ofono_mutex); }
 static char g_last_error[512] = {0};
 static char g_modem_path[64] =
     DEFAULT_MODEM_PATH; /* 缓存路径，仅用于 proxy 切换检测 */
@@ -218,19 +221,17 @@ int execute_at(const char *command, char **result) {
     }
   }
 
-  /* 获取互斥锁，确保串行执行 */
-  pthread_mutex_lock(&g_at_mutex);
-
   printf("准备发送 AT 命令: %s\n", command);
 
-  /* 重试逻辑 */
+  /* 重试逻辑：锁只围单次 SendAtcmd；InProgress 等待在锁外 */
   for (retry = 0; retry <= MAX_RETRIES; retry++) {
     error = NULL;
 
-    /* 调用 oFono 的 SendAtcmd 方法 */
+    ofono_lock();
     ret = g_dbus_proxy_call_sync(
         g_modem_proxy, "SendAtcmd", g_variant_new("(s)", command),
         G_DBUS_CALL_FLAGS_NONE, AT_COMMAND_TIMEOUT, NULL, &error);
+    ofono_unlock();
 
     if (!ret) {
       printf("调用 SendAtcmd 失败 (尝试 %d/%d) (%s): %s\n", retry + 1,
@@ -252,7 +253,7 @@ int execute_at(const char *command, char **result) {
       if (error && strstr(error->message, "Operation already in progress")) {
         printf("检测到 'Operation already in progress'，500ms 后重试...\n");
         g_error_free(error);
-        g_usleep(500000); /* 500ms */
+        g_usleep(500000); /* 锁外等待 */
         continue;
       }
 
@@ -279,7 +280,6 @@ int execute_at(const char *command, char **result) {
     break;
   }
 
-  pthread_mutex_unlock(&g_at_mutex);
   return rc;
 }
 
@@ -352,9 +352,11 @@ int ofono_network_get_mode_sync(const char *modem_path, char *buffer, int size,
     return -1;
   }
 
+  ofono_lock();
   result =
       g_dbus_proxy_call_sync(proxy, "GetProperties", NULL,
                              G_DBUS_CALL_FLAGS_NONE, timeout_ms, NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -469,11 +471,13 @@ int ofono_network_set_mode_sync(const char *modem_path, int mode,
     return -3;
   }
 
+  ofono_lock();
   result =
       g_dbus_proxy_call_sync(proxy, "SetProperty",
                              g_variant_new("(sv)", "TechnologyPreference",
                                            g_variant_new_string(mode_str)),
                              G_DBUS_CALL_FLAGS_NONE, timeout_ms, NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -506,11 +510,13 @@ int ofono_modem_set_online(const char *modem_path, int online, int timeout_ms) {
     return -2;
   }
 
+  ofono_lock();
   result = g_dbus_proxy_call_sync(
       proxy, "SetProperty",
       g_variant_new("(sv)", "Online",
                     g_variant_new_boolean(online ? TRUE : FALSE)),
       G_DBUS_CALL_FLAGS_NONE, timeout_ms, NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -568,9 +574,11 @@ int ofono_network_get_signal_strength(const char *modem_path, int *strength,
     return -2;
   }
 
+  ofono_lock();
   result =
       g_dbus_proxy_call_sync(proxy, "GetProperties", NULL,
                              G_DBUS_CALL_FLAGS_NONE, timeout_ms, NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -652,9 +660,11 @@ static int find_internet_context_path(char *path_buf, size_t buf_size) {
   }
 
   /* 调用 GetContexts 获取所有 context */
+  ofono_lock();
   result =
       g_dbus_proxy_call_sync(proxy, "GetContexts", NULL, G_DBUS_CALL_FLAGS_NONE,
                              OFONO_TIMEOUT_MS, NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -760,9 +770,11 @@ int ofono_get_data_status(int *active) {
     return -2;
   }
 
+  ofono_lock();
   result = g_dbus_proxy_call_sync(proxy, "GetProperties", NULL,
                                   G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS,
                                   NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -818,11 +830,13 @@ int ofono_set_data_status(int active) {
     return -2;
   }
 
+  ofono_lock();
   result = g_dbus_proxy_call_sync(
       proxy, "SetProperty",
       g_variant_new("(sv)", "Active",
                     g_variant_new_boolean(active ? TRUE : FALSE)),
       G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS, NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -874,9 +888,11 @@ int ofono_get_roaming_status(int *roaming_allowed, int *is_roaming) {
     return -2;
   }
 
+  ofono_lock();
   result = g_dbus_proxy_call_sync(proxy, "GetProperties", NULL,
                                   G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS,
                                   NULL, &error);
+  ofono_unlock();
 
   if (result) {
     GVariant *props = g_variant_get_child_value(result, 0);
@@ -916,9 +932,11 @@ int ofono_get_roaming_status(int *roaming_allowed, int *is_roaming) {
     return ret; /* 返回已获取的 roaming_allowed */
   }
 
+  ofono_lock();
   result = g_dbus_proxy_call_sync(proxy, "GetProperties", NULL,
                                   G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS,
                                   NULL, &error);
+  ofono_unlock();
 
   if (result) {
     GVariant *props = g_variant_get_child_value(result, 0);
@@ -968,11 +986,13 @@ int ofono_set_roaming_allowed(int allowed) {
     return -2;
   }
 
+  ofono_lock();
   result = g_dbus_proxy_call_sync(
       proxy, "SetProperty",
       g_variant_new("(sv)", "RoamingAllowed",
                     g_variant_new_boolean(allowed ? TRUE : FALSE)),
       G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS, NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -1010,9 +1030,11 @@ int ofono_get_all_apn_contexts(ApnContext *contexts, int max_count) {
   }
 
   /* 调用 GetContexts */
+  ofono_lock();
   result =
       g_dbus_proxy_call_sync(proxy, "GetContexts", NULL, G_DBUS_CALL_FLAGS_NONE,
                              OFONO_TIMEOUT_MS, NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -1145,10 +1167,12 @@ int ofono_set_apn_property(const char *context_path, const char *property,
     return -2;
   }
 
+  ofono_lock();
   result = g_dbus_proxy_call_sync(
       proxy, "SetProperty",
       g_variant_new("(sv)", property, g_variant_new_string(value)),
       G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS, NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -1185,9 +1209,11 @@ int ofono_set_apn_properties(const char *context_path, const char *apn,
     return -2;
   }
 
+  ofono_lock();
   result = g_dbus_proxy_call_sync(proxy, "GetProperties", NULL,
                                   G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS,
                                   NULL, &error);
+  ofono_unlock();
 
   if (result) {
     GVariant *props = g_variant_get_child_value(result, 0);
@@ -1214,10 +1240,12 @@ int ofono_set_apn_properties(const char *context_path, const char *apn,
                                   OFONO_SERVICE, context_path,
                                   OFONO_CONNECTION_CONTEXT, NULL, &error);
     if (proxy) {
+      ofono_lock();
       result = g_dbus_proxy_call_sync(
           proxy, "SetProperty",
           g_variant_new("(sv)", "Active", g_variant_new_boolean(FALSE)),
           G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS, NULL, &error);
+      ofono_unlock();
       if (result)
         g_variant_unref(result);
       if (error) {
@@ -1254,10 +1282,12 @@ int ofono_set_apn_properties(const char *context_path, const char *apn,
                                   OFONO_SERVICE, context_path,
                                   OFONO_CONNECTION_CONTEXT, NULL, &error);
     if (proxy) {
+      ofono_lock();
       result = g_dbus_proxy_call_sync(
           proxy, "SetProperty",
           g_variant_new("(sv)", "Active", g_variant_new_boolean(TRUE)),
           G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS, NULL, &error);
+      ofono_unlock();
       if (result)
         g_variant_unref(result);
       if (error)
@@ -1297,9 +1327,11 @@ int ofono_get_serving_cell_tech(char *tech, int size) {
   }
 
   /* 调用 GetServingCellInformation */
+  ofono_lock();
   result = g_dbus_proxy_call_sync(proxy, "GetServingCellInformation", NULL,
                                   G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS,
                                   NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -1370,9 +1402,11 @@ int ofono_get_serving_cell_info(char *tech, int tech_size, int *band) {
   }
 
   /* 调用 GetServingCellInformation */
+  ofono_lock();
   result = g_dbus_proxy_call_sync(proxy, "GetServingCellInformation", NULL,
                                   G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS,
                                   NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -1488,9 +1522,11 @@ int ofono_get_network_status(char *status, int size) {
     return -2;
   }
 
+  ofono_lock();
   result = g_dbus_proxy_call_sync(proxy, "GetProperties", NULL,
                                   G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS,
                                   NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -1629,9 +1665,11 @@ int ofono_check_and_restore_data(char *result, int size) {
     return -1;
   }
 
+  ofono_lock();
   ctx_result = g_dbus_proxy_call_sync(proxy, "GetProperties", NULL,
                                       G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS,
                                       NULL, &error);
+  ofono_unlock();
 
   if (!ctx_result) {
     if (error)
@@ -1736,9 +1774,11 @@ static int nr_lte_get_registration_technology(char *tech, size_t size) {
     return -2;
   }
 
+  ofono_lock();
   result = g_dbus_proxy_call_sync(proxy, "GetProperties", NULL,
                                   G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS,
                                   NULL, &error);
+  ofono_unlock();
   if (!result) {
     if (error)
       g_error_free(error);
