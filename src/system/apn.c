@@ -7,10 +7,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/stat.h>
 #include <pthread.h>
 #include "apn.h"
 #include "database.h"
+#include "exec_utils.h"
 #include "ofono.h"
+
+#define APN_BOOT_STATE_PATH "/mnt/data/apn-boot-apply.state"
+#define APN_BOOT_LOG_PATH "/mnt/data/logs/apn-boot-apply.log"
+#define APN_PERSIST_BASE1 "/mnt/data/ofono"
+#define APN_PERSIST_BASE2 "/mnt/userdata/data/ofono"
 
 /* APN模块专用互斥锁 */
 static pthread_mutex_t g_apn_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -19,10 +27,30 @@ static int g_apn_initialized = 0;
 /* 当前配置缓存 */
 static ApnConfig g_current_config = {0};
 
+typedef struct {
+    char apn[128];
+    char auth[32];
+    char user[128];
+    char pass[128];
+    char proto[32];
+} ApnBootTemplate;
+
 /* 前向声明 */
 static int create_apn_tables(void);
 static int load_apn_config(void);
 static int apply_apn_to_ofono(const ApnTemplate *tpl);
+static void apn_boot_log_line(const char *msg);
+static int apn_boot_set_state(const char *state);
+static int apn_boot_get_imsi(char *buf, size_t size);
+static int apn_boot_modem_online(void);
+static int apn_boot_wait_modem_online(int max_secs);
+static int apn_boot_write_persist(const ApnBootTemplate *tpl);
+static int apn_boot_load_template(ApnBootTemplate *tpl);
+static int apn_boot_is_active(void);
+static int apn_boot_activate_pdp_fallback(void);
+static void apn_boot_touch_tether_refresh(void);
+static int apn_boot_apply_full(const ApnBootTemplate *tpl);
+static void *apn_boot_persist_only_thread(void *arg);
 
 /**
  * 创建APN数据库表
@@ -178,58 +206,13 @@ int apn_init(const char *db_path) {
     /* 加载配置 */
     load_apn_config();
     
-    /* 处理自启动 */
-    if (g_current_config.mode == APN_MODE_MANUAL && 
-        g_current_config.auto_start == 1 && 
+    /* 处理自启动：走 full boot（persist → wait modem → 连接） */
+    if (g_current_config.mode == APN_MODE_MANUAL &&
+        g_current_config.auto_start == 1 &&
         g_current_config.template_id > 0) {
-        
-        printf("[APN] 检测到自启动配置，应用模板ID: %d\n", g_current_config.template_id);
-        
-        /* 获取模板 */
-        ApnTemplate tpl;
-        char sql[256];
-        snprintf(sql, sizeof(sql),
-            "SELECT id, name, apn, protocol, username, password, auth_method, created_at "
-            "FROM apn_templates WHERE id = %d;", g_current_config.template_id);
-        
-        char output[1024];
-        pthread_mutex_lock(&g_apn_mutex);
-        int ret = db_query_rows(sql, "|", output, sizeof(output));
-        pthread_mutex_unlock(&g_apn_mutex);
-        
-        if (ret == 0 && strlen(output) > 0) {
-            /* 解析模板数据 */
-            char *fields[8] = {NULL};
-            int field_count = 0;
-            char *p = output;
-            char *start = p;
-            
-            while (*p && field_count < 8) {
-                if (*p == '|') {
-                    *p = '\0';
-                    fields[field_count++] = start;
-                    start = p + 1;
-                }
-                p++;
-            }
-            if (field_count < 8 && start) {
-                fields[field_count++] = start;
-            }
-            
-            if (field_count >= 8) {
-                tpl.id = atoi(fields[0]);
-                strncpy(tpl.name, fields[1], sizeof(tpl.name) - 1);
-                strncpy(tpl.apn, fields[2], sizeof(tpl.apn) - 1);
-                strncpy(tpl.protocol, fields[3], sizeof(tpl.protocol) - 1);
-                strncpy(tpl.username, fields[4], sizeof(tpl.username) - 1);
-                strncpy(tpl.password, fields[5], sizeof(tpl.password) - 1);
-                strncpy(tpl.auth_method, fields[6], sizeof(tpl.auth_method) - 1);
-                tpl.created_at = (time_t)atol(fields[7]);
-                
-                /* 应用模板 */
-                apply_apn_to_ofono(&tpl);
-            }
-        }
+        printf("[APN] 检测到自启动配置，模板ID: %d，启动 apn_boot_apply(full)\n",
+               g_current_config.template_id);
+        apn_boot_apply("full");
     }
     
     g_apn_initialized = 1;
@@ -721,4 +704,421 @@ int apn_template_get_status(int id, ApnTemplateStatus *status) {
     }
     
     return 0;
+}
+
+/* ==================== APN boot apply（apn-boot-apply.sh 语义） ==================== */
+
+static void apn_boot_log_line(const char *msg) {
+    FILE *fp;
+    time_t now;
+    struct tm tm_info;
+    char ts[32];
+
+    if (!msg) {
+        return;
+    }
+    mkdir("/mnt/data/logs", 0755);
+    fp = fopen(APN_BOOT_LOG_PATH, "a");
+    if (!fp) {
+        return;
+    }
+    now = time(NULL);
+    localtime_r(&now, &tm_info);
+    strftime(ts, sizeof(ts), "%F %T", &tm_info);
+    fprintf(fp, "%s %s\n", ts, msg);
+    fclose(fp);
+}
+
+static int apn_boot_set_state(const char *state) {
+    FILE *fp;
+
+    if (!state) {
+        return -1;
+    }
+    mkdir("/mnt/data", 0755);
+    fp = fopen(APN_BOOT_STATE_PATH, "w");
+    if (!fp) {
+        return -1;
+    }
+    fprintf(fp, "%s", state);
+    fclose(fp);
+    return 0;
+}
+
+static int apn_boot_get_imsi(char *buf, size_t size) {
+    char output[256];
+
+    if (!buf || size == 0) {
+        return -1;
+    }
+    buf[0] = '\0';
+    if (run_command(output, sizeof(output), "sh", "-c",
+                    "ls " APN_PERSIST_BASE1 " 2>/dev/null | grep -E '^[0-9]{15}$' | head -1",
+                    NULL) == 0 &&
+        output[0] != '\0') {
+        strncpy(buf, output, size - 1);
+        buf[size - 1] = '\0';
+        return 0;
+    }
+    if (run_command(output, sizeof(output), "sh", "-c",
+                    "connmanctl services 2>/dev/null | grep -oE '460[0-9]{12}' | head -1",
+                    NULL) == 0 &&
+        output[0] != '\0') {
+        strncpy(buf, output, size - 1);
+        buf[size - 1] = '\0';
+        return 0;
+    }
+    return -1;
+}
+
+static int apn_boot_modem_online(void) {
+    int active = 0;
+    return ofono_get_data_status(&active) != -2;
+}
+
+static int apn_boot_wait_modem_online(int max_secs) {
+    int waited = 0;
+
+    while (waited < max_secs) {
+        if (apn_boot_modem_online()) {
+            return 0;
+        }
+        sleep(2);
+        waited += 2;
+    }
+    return -1;
+}
+
+static int apn_boot_write_persist_file(const char *base, const char *imsi,
+                                       const ApnBootTemplate *tpl) {
+    char dir[256];
+    char path[320];
+    FILE *fp;
+    const char *auth;
+    const char *user;
+    const char *pass;
+    const char *proto;
+
+    snprintf(dir, sizeof(dir), "%s/%s", base, imsi);
+    mkdir(base, 0755);
+    mkdir(dir, 0755);
+    snprintf(path, sizeof(path), "%s/defult_apn", dir);
+    auth = (tpl->auth[0] != '\0') ? tpl->auth : "none";
+    user = tpl->user;
+    pass = tpl->pass;
+    proto = (tpl->proto[0] != '\0') ? tpl->proto : "dual";
+
+    fp = fopen(path, "w");
+    if (!fp) {
+        return -1;
+    }
+    fprintf(fp, "[userDefultApn]\n");
+    fprintf(fp, "AccessPointName=%s\n", tpl->apn);
+    fprintf(fp, "Username=%s\n", user ? user : "");
+    fprintf(fp, "Password=%s\n", pass ? pass : "");
+    fprintf(fp, "AuthenticationMethod=%s\n", auth);
+    fprintf(fp, "Protocol=%s\n", proto);
+    fclose(fp);
+    sync();
+    return 0;
+}
+
+static int apn_boot_write_persist(const ApnBootTemplate *tpl) {
+    char imsi[32];
+
+    if (!tpl || tpl->apn[0] == '\0') {
+        return -1;
+    }
+    if (apn_boot_get_imsi(imsi, sizeof(imsi)) != 0) {
+        apn_boot_log_line("persist: no imsi");
+        return -1;
+    }
+    if (apn_boot_write_persist_file(APN_PERSIST_BASE1, imsi, tpl) != 0 &&
+        apn_boot_write_persist_file(APN_PERSIST_BASE2, imsi, tpl) != 0) {
+        return -1;
+    }
+    {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "persist ok imsi=%s apn=%s auth=%s", imsi,
+                 tpl->apn, tpl->auth[0] ? tpl->auth : "none");
+        apn_boot_log_line(msg);
+    }
+    return 0;
+}
+
+static int apn_boot_load_template(ApnBootTemplate *tpl) {
+    char sql[256];
+    char output[512];
+    char *fields[5];
+    int field_count = 0;
+    char *p;
+    char *start;
+
+    if (!tpl) {
+        return -1;
+    }
+    memset(tpl, 0, sizeof(*tpl));
+
+    if (g_current_config.mode != APN_MODE_MANUAL ||
+        g_current_config.auto_start != 1 ||
+        g_current_config.template_id <= 0) {
+        return -1;
+    }
+
+    snprintf(sql, sizeof(sql),
+             "SELECT apn, auth_method, username, password, protocol "
+             "FROM apn_templates WHERE id = %d;",
+             g_current_config.template_id);
+
+    pthread_mutex_lock(&g_apn_mutex);
+    int ret = db_query_rows(sql, "|", output, sizeof(output));
+    pthread_mutex_unlock(&g_apn_mutex);
+
+    if (ret != 0 || output[0] == '\0') {
+        return -1;
+    }
+
+    p = output;
+    start = p;
+    while (*p && field_count < 5) {
+        if (*p == '|') {
+            *p = '\0';
+            fields[field_count++] = start;
+            start = p + 1;
+        }
+        p++;
+    }
+    if (field_count < 5 && start) {
+        fields[field_count++] = start;
+    }
+    if (field_count < 5) {
+        return -1;
+    }
+
+    strncpy(tpl->apn, fields[0], sizeof(tpl->apn) - 1);
+    strncpy(tpl->auth, fields[1], sizeof(tpl->auth) - 1);
+    strncpy(tpl->user, fields[2], sizeof(tpl->user) - 1);
+    strncpy(tpl->pass, fields[3], sizeof(tpl->pass) - 1);
+    strncpy(tpl->proto, fields[4], sizeof(tpl->proto) - 1);
+    if (tpl->proto[0] == '\0') {
+        strncpy(tpl->proto, "dual", sizeof(tpl->proto) - 1);
+    }
+    return 0;
+}
+
+static int apn_boot_is_active(void) {
+    int active = 0;
+    if (apn_boot_modem_online() &&
+        ofono_get_data_status(&active) == 0 && active) {
+        return 1;
+    }
+    return 0;
+}
+
+static int apn_boot_activate_pdp_fallback(void) {
+    char dummy[64];
+
+    run_command(dummy, sizeof(dummy), "connmanctl", "setautoconnect", "on", NULL);
+    run_command(dummy, sizeof(dummy), "connmanctl", "ActivatePdp", "1", NULL);
+    sleep(5);
+    return apn_boot_is_active() ? 0 : -1;
+}
+
+static void apn_boot_touch_tether_refresh(void) {
+    FILE *fp = fopen("/tmp/usb-tether-refresh", "w");
+    if (fp) {
+        fclose(fp);
+    }
+}
+
+static int apn_boot_apply_full(const ApnBootTemplate *tpl) {
+    ApnTemplate atpl;
+    int active = 0;
+    int i;
+
+    apn_boot_set_state("running");
+    apn_boot_log_line("config ok, sleeping 20s");
+    sleep(20);
+
+    for (i = 0; i < 12; i++) {
+        char ps_out[64];
+        if (run_command(ps_out, sizeof(ps_out), "sh", "-c", "ps | grep -q '[o]fonod'",
+                        NULL) == 0) {
+            break;
+        }
+        sleep(5);
+    }
+
+    if (apn_boot_write_persist(tpl) != 0) {
+        apn_boot_set_state("failed");
+        return -1;
+    }
+    if (apn_boot_wait_modem_online(90) != 0) {
+        apn_boot_log_line("modem not online");
+        apn_boot_set_state("failed");
+        return -1;
+    }
+
+    if (apn_boot_is_active()) {
+        ApnContext contexts[MAX_APN_CONTEXTS];
+        int count = ofono_get_all_apn_contexts(contexts, MAX_APN_CONTEXTS);
+        for (i = 0; i < count; i++) {
+            if (strcmp(contexts[i].context_type, "internet") == 0 &&
+                strcmp(contexts[i].apn, tpl->apn) == 0) {
+                apn_boot_log_line("already applied");
+                apn_boot_set_state("activated");
+                apn_boot_touch_tether_refresh();
+                return 0;
+            }
+        }
+    }
+
+    memset(&atpl, 0, sizeof(atpl));
+    strncpy(atpl.apn, tpl->apn, sizeof(atpl.apn) - 1);
+    strncpy(atpl.protocol, tpl->proto, sizeof(atpl.protocol) - 1);
+    strncpy(atpl.username, tpl->user, sizeof(atpl.username) - 1);
+    strncpy(atpl.password, tpl->pass, sizeof(atpl.password) - 1);
+    strncpy(atpl.auth_method, tpl->auth, sizeof(atpl.auth_method) - 1);
+
+    if (apply_apn_to_ofono(&atpl) != 0) {
+        apn_boot_set_state("failed");
+        return -1;
+    }
+
+    ofono_set_data_status(1);
+    sleep(8);
+    if (ofono_get_data_status(&active) == 0 && active) {
+        apn_boot_set_state("activated");
+        apn_boot_touch_tether_refresh();
+        return 0;
+    }
+
+    apn_boot_set_state("failed");
+    return -1;
+}
+
+static void *apn_boot_persist_only_thread(void *arg) {
+    ApnBootTemplate *tpl = (ApnBootTemplate *)arg;
+    int waited = 0;
+
+    while (waited < 120) {
+        if (apn_boot_write_persist(tpl) == 0) {
+            apn_boot_log_line("persist-only done");
+            apn_boot_set_state("persist-only-ok");
+            break;
+        }
+        sleep(2);
+        waited += 2;
+    }
+    free(tpl);
+    return NULL;
+}
+
+int apn_boot_apply(const char *mode) {
+    ApnBootTemplate tpl;
+    const char *m = mode ? mode : "full";
+    char logbuf[128];
+    int waited;
+
+    snprintf(logbuf, sizeof(logbuf), "apn-boot-apply start mode=%s", m);
+    apn_boot_log_line(logbuf);
+
+    if (strcmp(m, "bounce-pdp") == 0) {
+        apn_boot_log_line("bounce-pdp start");
+        if (!apn_boot_modem_online()) {
+            apn_boot_log_line("bounce-pdp modem offline");
+            apn_boot_set_state("failed");
+            return -1;
+        }
+        apn_boot_log_line("bounce-pdp dbus Active=false");
+        if (ofono_bounce_pdp_context() == 0) {
+            apn_boot_log_line("bounce-pdp ok (dbus)");
+            apn_boot_set_state("activated");
+            apn_boot_touch_tether_refresh();
+            return 0;
+        }
+        apn_boot_log_line("bounce-pdp fallback ActivatePdp");
+        if (apn_boot_activate_pdp_fallback() == 0) {
+            apn_boot_log_line("bounce-pdp ok (ActivatePdp)");
+            apn_boot_set_state("activated");
+            apn_boot_touch_tether_refresh();
+            return 0;
+        }
+        apn_boot_log_line("bounce-pdp failed");
+        apn_boot_set_state("failed");
+        return -1;
+    }
+
+    if (strcmp(m, "reactivate-only") == 0) {
+        apn_boot_log_line("reactivate-only start");
+        if (apn_boot_wait_modem_online(90) != 0) {
+            apn_boot_log_line("reactivate-only modem offline");
+            apn_boot_set_state("failed");
+            return -1;
+        }
+        if (apn_boot_is_active()) {
+            apn_boot_log_line("reactivate-only already active");
+            apn_boot_set_state("activated");
+            apn_boot_touch_tether_refresh();
+            return 0;
+        }
+        apn_boot_log_line("reactivate-only dbus Active=true");
+        ofono_set_data_status(1);
+        if (apn_boot_is_active()) {
+            apn_boot_log_line("reactivate-only ok (dbus)");
+            apn_boot_set_state("activated");
+            apn_boot_touch_tether_refresh();
+            return 0;
+        }
+        waited = 0;
+        while (waited < 30) {
+            if (apn_boot_is_active()) {
+                apn_boot_log_line("reactivate-only ok (dbus)");
+                apn_boot_set_state("activated");
+                apn_boot_touch_tether_refresh();
+                return 0;
+            }
+            sleep(2);
+            waited += 2;
+        }
+        apn_boot_log_line("reactivate-only fallback ActivatePdp");
+        if (apn_boot_activate_pdp_fallback() == 0) {
+            apn_boot_log_line("reactivate-only ok (ActivatePdp)");
+            apn_boot_set_state("activated");
+            apn_boot_touch_tether_refresh();
+            return 0;
+        }
+        apn_boot_log_line("reactivate-only failed");
+        apn_boot_set_state("failed");
+        return -1;
+    }
+
+    if (apn_boot_load_template(&tpl) != 0) {
+        apn_boot_set_state("skip");
+        return 0;
+    }
+
+    if (strcmp(m, "persist-only") == 0) {
+        ApnBootTemplate *heap_tpl = (ApnBootTemplate *)malloc(sizeof(ApnBootTemplate));
+        pthread_t tid;
+
+        apn_boot_set_state("persist-only-ok");
+        if (!heap_tpl) {
+            return -1;
+        }
+        *heap_tpl = tpl;
+        if (pthread_create(&tid, NULL, apn_boot_persist_only_thread, heap_tpl) == 0) {
+            pthread_detach(tid);
+            return 0;
+        }
+        free(heap_tpl);
+        return -1;
+    }
+
+    if (strcmp(m, "full") == 0) {
+        return apn_boot_apply_full(&tpl);
+    }
+
+    apn_boot_log_line("unknown mode");
+    return -1;
 }

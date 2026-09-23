@@ -1515,11 +1515,23 @@ static int ofono_egress_reachable(void) {
   return 0;
 }
 
+int ofono_bounce_pdp_context(void) {
+  (void)ofono_set_data_status(0);
+  sleep(4);
+  if (ofono_set_data_status(1) != 0) {
+    return -1;
+  }
+  int active = 0;
+  if (ofono_get_data_status(&active) == 0 && active) {
+    return 0;
+  }
+  return -1;
+}
+
 /**
- * 强制 PDP 翻转（等同补丁 bounce-pdp）。
- * 使用 ofono_set_data_status：关闭后再开启会重新拉起 DataMonitor。
+ * 强制 PDP 翻转（watchdog 用，含冷却与 egress 校验）。
  */
-static int ofono_bounce_pdp(void) {
+int ofono_bounce_pdp(void) {
   time_t now = time(NULL);
   if (g_last_egress_bounce_ts != 0 &&
       (now - g_last_egress_bounce_ts) < OFONO_EGRESS_BOUNCE_COOLDOWN_S) {
@@ -1528,9 +1540,7 @@ static int ofono_bounce_pdp(void) {
   g_last_egress_bounce_ts = now;
 
   printf("[DataRestore] egress dead while Active — bouncing PDP\n");
-  (void)ofono_set_data_status(0);
-  sleep(3);
-  if (ofono_set_data_status(1) != 0) {
+  if (ofono_bounce_pdp_context() != 0) {
     return -1;
   }
   sleep(2);

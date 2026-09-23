@@ -217,6 +217,18 @@ int ofono_get_serving_cell_info(char *tech, int tech_size, int *band);
 int ofono_get_network_status(char *status, int size);
 
 /**
+ * PDP context Active false→true（等同 apn-boot-apply bounce-pdp dbus 序列）
+ * @return 成功且 Active 返回 0，否则 -1
+ */
+int ofono_bounce_pdp_context(void);
+
+/**
+ * 强制 PDP 翻转（watchdog 用，含 90s 冷却与 egress 校验）
+ * @return 成功 0，失败 -1，冷却中 -2
+ */
+int ofono_bounce_pdp(void);
+
+/**
  * 检查并恢复数据连接
  * - APN 已配置且 Active=false → 尝试激活
  * - Active=true 但公网 ICMP 不可达 → bounce PDP（false→true），冷却 90s
