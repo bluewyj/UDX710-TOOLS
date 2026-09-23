@@ -110,17 +110,36 @@ static int apply_nat66(const char *uplink) {
 }
 
 #pragma pack(push, 1)
+/* RFC 6106 RDNSS — type 25, len=5 for two addresses */
+struct nd_opt_rdnss2 {
+  uint8_t type;
+  uint8_t len;
+  uint16_t reserved;
+  uint32_t lifetime;
+  uint8_t addr1[16];
+  uint8_t addr2[16];
+};
+
 struct ra_pkt {
   struct nd_router_advert ra;
   struct nd_opt_prefix_info pi;
+  struct nd_opt_rdnss2 rdnss;
 };
 #pragma pack(pop)
+
+#ifndef ND_OPT_RDNSS
+#define ND_OPT_RDNSS 25
+#endif
+
+/* Public recursive DNS so Windows NCSI/IPv6 name resolve works without
+ * carrier DNS on the ULA path (NAT66). Prefer AliDNS then Google. */
+static const char *k_rdnss1 = "2400:3200::1";
+static const char *k_rdnss2 = "2001:4860:4860::8888";
 
 static int send_one_ra(int ifindex) {
   int fd;
   struct sockaddr_in6 dst;
   struct ra_pkt pkt;
-  struct ipv6_mreq mreq;
   int hops = 255;
   unsigned char prefix[16];
 
@@ -151,15 +170,25 @@ static int send_one_ra(int ifindex) {
 
   pkt.pi.nd_opt_pi_type = ND_OPT_PREFIX_INFORMATION;
   pkt.pi.nd_opt_pi_len = 4;
-  pkt.pi.nd_opt_pi_prefix_len = IPV6_TETHER_ULA_PLEN;
+  pkt.pi.nd_opt_pi_prefix_len = IPV6_TETHER_LAN_PLEN;
   pkt.pi.nd_opt_pi_flags_reserved = ND_OPT_PI_FLAG_ONLINK | ND_OPT_PI_FLAG_AUTO;
   pkt.pi.nd_opt_pi_valid_time = htonl(7200);
   pkt.pi.nd_opt_pi_preferred_time = htonl(3600);
-  if (inet_pton(AF_INET6, IPV6_TETHER_ULA_PREFIX, prefix) != 1) {
+  if (inet_pton(AF_INET6, IPV6_TETHER_LAN_PREFIX, prefix) != 1) {
     close(fd);
     return -1;
   }
   memcpy(&pkt.pi.nd_opt_pi_prefix, prefix, 16);
+
+  pkt.rdnss.type = ND_OPT_RDNSS;
+  pkt.rdnss.len = 5; /* 8 + 32 bytes */
+  pkt.rdnss.reserved = 0;
+  pkt.rdnss.lifetime = htonl(RA_ROUTER_LIFETIME);
+  if (inet_pton(AF_INET6, k_rdnss1, pkt.rdnss.addr1) != 1 ||
+      inet_pton(AF_INET6, k_rdnss2, pkt.rdnss.addr2) != 1) {
+    close(fd);
+    return -1;
+  }
 
   memset(&dst, 0, sizeof(dst));
   dst.sin6_family = AF_INET6;
@@ -172,7 +201,6 @@ static int send_one_ra(int ifindex) {
     return -1;
   }
 
-  (void)mreq;
   close(fd);
   return 0;
 }
@@ -229,26 +257,29 @@ int ipv6_tether_ensure(void) {
   (void)write_proc(cmd, "1");
 
   snprintf(cmd, sizeof(cmd), "ip -6 addr replace %s/%d dev %s",
-           IPV6_TETHER_ULA_GW, IPV6_TETHER_ULA_PLEN, USB_IFACE);
+           IPV6_TETHER_LAN_GW, IPV6_TETHER_LAN_PLEN, USB_IFACE);
   if (run_sh(cmd) != 0) {
     /* #region agent log */
-    dbg_log("H3", "ipv6_tether.c:ensure", "ula add fail", "{}");
+    dbg_log("H-ULA", "ipv6_tether.c:ensure", "lan prefix add fail", "{}");
     /* #endregion */
     return -1;
   }
 
+  /* 清掉旧 ULA，避免 PC 仍挂 fd66 */
+  (void)run_sh("ip -6 addr del fd66:6677::1/64 dev usb0 2>/dev/null || true");
+
   if (apply_nat66(uplink) != 0) {
     /* #region agent log */
-    dbg_log("H3", "ipv6_tether.c:ensure", "nat66 fail", "{}");
+    dbg_log("H-ULA", "ipv6_tether.c:ensure", "nat66 fail", "{}");
     /* #endregion */
     return -1;
   }
 
   /* #region agent log */
   snprintf(data, sizeof(data),
-           "{\"uplink\":\"%s\",\"ula\":\"%s\",\"forwarding\":1}", uplink,
-           IPV6_TETHER_ULA_GW);
-  dbg_log("H3", "ipv6_tether.c:ensure", "nat66 ok", data);
+           "{\"uplink\":\"%s\",\"gw\":\"%s\",\"forwarding\":1,\"rdnss\":1}",
+           uplink, IPV6_TETHER_LAN_GW);
+  dbg_log("H-ULA", "ipv6_tether.c:ensure", "nat66+global-prefix ok", data);
   /* #endregion */
 
   if (!g_started) {
@@ -267,7 +298,7 @@ int ipv6_tether_ensure(void) {
 
   /* 立即立刻发一次 RA */
   (void)send_one_ra((int)ifindex);
-  printf("[boot] ipv6 tether ensured (ULA %s via %s)\n", IPV6_TETHER_ULA_GW,
+  printf("[boot] ipv6 tether ensured (LAN %s via %s)\n", IPV6_TETHER_LAN_GW,
          uplink);
   return 0;
 }
