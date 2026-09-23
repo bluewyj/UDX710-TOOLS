@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1568,19 +1569,78 @@ int ofono_get_network_status(char *status, int size) {
 
 static time_t g_last_egress_bounce_ts = 0;
 
+static const char *const OFONO_EGRESS_IPV4_TARGETS[] = {
+    "211.138.245.180",
+    "211.138.240.100",
+    "223.5.5.5",
+    "8.8.8.8",
+};
+
+#define OFONO_CONNECTIVITY_IPV6_TARGET "2400:3200::1"
+
 static int ofono_egress_reachable(void) {
-  /* CN carrier DNS first; AliDNS then 8.8.8.8 as fallback */
-  if (system("ping -c 1 -W 2 211.138.245.180 >/dev/null 2>&1") == 0) {
-    return 1;
+  size_t i;
+  char cmd[128];
+  for (i = 0; i < sizeof(OFONO_EGRESS_IPV4_TARGETS) /
+                       sizeof(OFONO_EGRESS_IPV4_TARGETS[0]);
+       i++) {
+    snprintf(cmd, sizeof(cmd), "ping -c 1 -W 2 %s >/dev/null 2>&1",
+             OFONO_EGRESS_IPV4_TARGETS[i]);
+    if (system(cmd) == 0)
+      return 1;
   }
-  if (system("ping -c 1 -W 2 211.138.240.100 >/dev/null 2>&1") == 0) {
-    return 1;
+  return 0;
+}
+
+int ofono_probe_connectivity(OfonoConnectivityProbe *out) {
+  size_t i;
+  char cmd[160];
+  struct timeval t0, t1;
+  if (!out)
+    return -1;
+  memset(out, 0, sizeof(*out));
+
+  /* IPv4：短路成功 */
+  out->ipv4.success = 0;
+  snprintf(out->ipv4.error, sizeof(out->ipv4.error), "unreachable");
+  for (i = 0; i < sizeof(OFONO_EGRESS_IPV4_TARGETS) /
+                       sizeof(OFONO_EGRESS_IPV4_TARGETS[0]);
+       i++) {
+    snprintf(out->ipv4.target, sizeof(out->ipv4.target), "%s",
+             OFONO_EGRESS_IPV4_TARGETS[i]);
+    snprintf(cmd, sizeof(cmd), "ping -c 1 -W 2 %s >/dev/null 2>&1",
+             OFONO_EGRESS_IPV4_TARGETS[i]);
+    gettimeofday(&t0, NULL);
+    if (system(cmd) == 0) {
+      gettimeofday(&t1, NULL);
+      out->ipv4.success = 1;
+      out->ipv4.error[0] = '\0';
+      out->ipv4.latency_ms =
+          (t1.tv_sec - t0.tv_sec) * 1000.0 +
+          (t1.tv_usec - t0.tv_usec) / 1000.0;
+      break;
+    }
   }
-  if (system("ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1") == 0) {
-    return 1;
+  if (!out->ipv4.success && out->ipv4.target[0] == '\0') {
+    snprintf(out->ipv4.target, sizeof(out->ipv4.target), "%s",
+             OFONO_EGRESS_IPV4_TARGETS[0]);
   }
-  if (system("ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1") == 0) {
-    return 1;
+
+  /* IPv6：固定阿里 DNS */
+  snprintf(out->ipv6.target, sizeof(out->ipv6.target), "%s",
+           OFONO_CONNECTIVITY_IPV6_TARGET);
+  snprintf(cmd, sizeof(cmd), "ping6 -c 1 -W 2 %s >/dev/null 2>&1",
+           OFONO_CONNECTIVITY_IPV6_TARGET);
+  gettimeofday(&t0, NULL);
+  if (system(cmd) == 0) {
+    gettimeofday(&t1, NULL);
+    out->ipv6.success = 1;
+    out->ipv6.latency_ms =
+        (t1.tv_sec - t0.tv_sec) * 1000.0 +
+        (t1.tv_usec - t0.tv_usec) / 1000.0;
+  } else {
+    out->ipv6.success = 0;
+    snprintf(out->ipv6.error, sizeof(out->ipv6.error), "unreachable");
   }
   return 0;
 }

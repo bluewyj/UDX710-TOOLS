@@ -208,6 +208,25 @@ int ofono_get_serving_cell_info(char *tech, int tech_size, int *band);
 
 /* ==================== 数据连接 Watchdog API ==================== */
 
+typedef struct {
+  int success;           /* 1/0 */
+  char target[64];
+  double latency_ms;     /* 成功时填；失败可 0 */
+  char error[128];       /* 失败时非空 */
+} OfonoProbeResult;
+
+typedef struct {
+  OfonoProbeResult ipv4;
+  OfonoProbeResult ipv6;
+} OfonoConnectivityProbe;
+
+/**
+ * 双栈连通性探测（仅 ping/ping6；不得拿 ofono 锁；不得 bounce）
+ * @param out 输出探测结果
+ * @return 成功返回 0，参数无效返回 -1
+ */
+int ofono_probe_connectivity(OfonoConnectivityProbe *out);
+
 /**
  * 获取网络注册状态
  * @param status 输出状态字符串 (如 "registered", "roaming", "searching")
