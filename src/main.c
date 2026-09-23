@@ -53,9 +53,9 @@ int main(int argc, char *argv[]) {
   printf("启动数据连接监听...\n");
   ofono_start_data_monitor();
 
-  /* 定时巡检：信号漏报时仍能发现 zombie Active 并 bounce PDP */
-  printf("启动数据连接 Watchdog (60s)...\n");
-  if (ofono_start_data_watchdog(60) != 0) {
+  /* 定时巡检：PARTIAL/TOTAL outage streak（30s 对齐壳 INTERVAL） */
+  printf("启动数据连接 Watchdog (30s)...\n");
+  if (ofono_start_data_watchdog(30) != 0) {
     fprintf(stderr, "警告: 数据连接 Watchdog 启动失败\n");
   }
 

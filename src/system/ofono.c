@@ -8,9 +8,11 @@
  * - oFono 服务调用（网络模式、APN、信号等）
  */
 
+#include "exec_utils.h"
 #include "ofono.h"
 #include "dbus_core.h"
 #include "sysinfo.h"
+#include "usb_mode.h"
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -1424,10 +1426,31 @@ int ofono_get_serving_cell_info(char *tech, int tech_size, int *band) {
 
 /* ==================== 数据连接 Watchdog 实现 ==================== */
 
+#define OUTAGE_INTERVAL_S              30
+#define PARTIAL_BOUNCE_STREAK          20
+#define PARTIAL_BOUNCE_RETRY           26
+#define PARTIAL_REBOOT_STREAK          30
+#define TOTAL_REBOOT_STREAK            12
+#define TOTAL_ESCALATE_WINDOW_S       3600
+#define TOTAL_REBOOT_MAX_DAY           2
+#define PARTIAL_GRACE_S              1800
+#define OUTAGE_BOOT_GRACE_S            120
+#define OUTAGE_PARTIAL_ACT_STREAK       3
+#define OUTAGE_TOTAL_LIGHT_EVERY        3
+#define OUTAGE_TOTAL_UDC_EVERY          4
+#define OUTAGE_REBOOT_DAY_FILE     "/mnt/data/outage-watch-reboot-day"
+#define OUTAGE_REBOOT_PENDING_FILE "/mnt/data/outage-watch-reboot-pending"
+#define OUTAGE_PARTIAL_GRACE_FILE  "/mnt/data/outage-watch-partial-grace"
+
 static pthread_t g_watchdog_thread = 0;
 static volatile int g_watchdog_running = 0;
 static int g_watchdog_interval = 10; /* 默认10秒 */
 static char g_last_watchdog_status[256] = {0};
+static time_t g_outage_boot_ts = 0;
+static int g_partial_streak = 0;
+static int g_total_streak = 0;
+static int g_partial_bounce_count = 0;
+static int g_partial_bounce_retry_pending = 0;
 
 /**
  * 获取网络注册状态
@@ -1635,25 +1658,14 @@ int ofono_check_and_restore_data(char *result, int size) {
     return 0;
   }
 
-  /* 5. Active=true：必须 egress 可达，否则视为 zombie Active 并 bounce */
+  /* 5. Active=true：egress 由 watchdog streak 触发 bounce，此处不立即 bounce */
   if (active) {
     if (ofono_egress_reachable()) {
       snprintf(result, size, "已连接 (APN: %s)", apn);
       return 0;
     }
-    {
-      int br = ofono_bounce_pdp();
-      if (br == 0) {
-        snprintf(result, size, "egress 恢复 (bounce PDP, APN: %s)", apn);
-        return 0;
-      }
-      if (br == -2) {
-        snprintf(result, size, "egress 异常，bounce 冷却中 (APN: %s)", apn);
-        return -1;
-      }
-      snprintf(result, size, "egress 异常，bounce 失败 (APN: %s)", apn);
-      return -1;
-    }
+    snprintf(result, size, "egress dead (APN: %s), wait streak bounce", apn);
+    return 0;
   }
 
   /* 6. Active=false：尝试激活数据连接 */
@@ -1666,6 +1678,371 @@ int ofono_check_and_restore_data(char *result, int size) {
   }
 }
 
+static int outage_has_gateway(void) {
+  return system("ifconfig usb0 2>/dev/null | grep -q 'inet addr:192.168.66.1'") ==
+         0;
+}
+
+static int outage_dhcp_ok(void) {
+  return system("netstat -uln 2>/dev/null | grep -q ':67'") == 0;
+}
+
+static int outage_cell_active(void) {
+  int active = 0;
+  return ofono_get_data_status(&active) == 0 && active;
+}
+
+static int outage_usb0_has_inet(void) {
+  return system("ifconfig usb0 2>/dev/null | grep -q 'inet addr:'") == 0;
+}
+
+static int outage_total_due(int streak, int first, int every) {
+  if (streak < first || every <= 0)
+    return 0;
+  return ((streak - first) % every) == 0;
+}
+
+static int outage_reboot_count_for_day(const char *want_day) {
+  FILE *f = fopen(OUTAGE_REBOOT_DAY_FILE, "r");
+  if (!f)
+    return 0;
+  char stored_day[16] = {0};
+  int stored_cnt = 0;
+  if (fscanf(f, "%15s %d", stored_day, &stored_cnt) == 2 &&
+      strcmp(stored_day, want_day) == 0) {
+    fclose(f);
+    return stored_cnt;
+  }
+  fclose(f);
+  return 0;
+}
+
+static void outage_today_str(char *buf, size_t size) {
+  time_t now = time(NULL);
+  struct tm tm;
+  if (now == (time_t)-1 || !localtime_r(&now, &tm)) {
+    strncpy(buf, "unknown", size - 1);
+    buf[size - 1] = '\0';
+    return;
+  }
+  strftime(buf, size, "%Y-%m-%d", &tm);
+}
+
+static int outage_is_iso_day(const char *day) {
+  return day && strlen(day) == 10 && day[4] == '-' && day[7] == '-';
+}
+
+static void outage_budget_accounting_day(char *chosen, size_t size) {
+  char clock_day[16];
+  char anchor[16] = {0};
+  outage_today_str(clock_day, sizeof(clock_day));
+
+  FILE *pf = fopen(OUTAGE_REBOOT_PENDING_FILE, "r");
+  if (pf) {
+    char pending_day[16] = {0};
+    if (fscanf(pf, "%15s", pending_day) == 1 && outage_is_iso_day(pending_day))
+      strncpy(anchor, pending_day, sizeof(anchor) - 1);
+    fclose(pf);
+  }
+  if (anchor[0] == '\0') {
+    FILE *df = fopen(OUTAGE_REBOOT_DAY_FILE, "r");
+    if (df) {
+      char stored_day[16] = {0};
+      int cnt = 0;
+      if (fscanf(df, "%15s %d", stored_day, &cnt) == 2 &&
+          outage_is_iso_day(stored_day))
+        strncpy(anchor, stored_day, sizeof(anchor) - 1);
+      fclose(df);
+    }
+  }
+
+  strncpy(chosen, clock_day, size - 1);
+  chosen[size - 1] = '\0';
+  if (anchor[0] != '\0' && strcmp(clock_day, "unknown") != 0 &&
+      strcmp(clock_day, anchor) != 0 && strcmp(clock_day, anchor) < 0)
+    strncpy(chosen, anchor, size - 1);
+}
+
+static int outage_total_reboot_count_today(void) {
+  char day[16];
+  outage_budget_accounting_day(day, sizeof(day));
+  return outage_reboot_count_for_day(day);
+}
+
+static int outage_total_reboot_effective_count(void) {
+  int count = outage_total_reboot_count_today();
+  if (access(OUTAGE_REBOOT_PENDING_FILE, F_OK) == 0)
+    count++;
+  return count;
+}
+
+static int outage_total_reboot_budget_exhausted(void) {
+  return outage_total_reboot_effective_count() >= TOTAL_REBOOT_MAX_DAY;
+}
+
+static int outage_commit_pending_reboot_budget(void) {
+  FILE *pf = fopen(OUTAGE_REBOOT_PENDING_FILE, "r");
+  if (!pf)
+    return 0;
+  char pending_day[16] = {0};
+  char rest[128] = {0};
+  if (fscanf(pf, "%15s %127[^\n]", pending_day, rest) < 1) {
+    fclose(pf);
+    return -1;
+  }
+  fclose(pf);
+
+  char clock_day[16];
+  outage_today_str(clock_day, sizeof(clock_day));
+  const char *day =
+      outage_is_iso_day(pending_day) ? pending_day : clock_day;
+  int count = outage_reboot_count_for_day(day) + 1;
+
+  for (int i = 0; i < 15; i++) {
+    FILE *wf = fopen(OUTAGE_REBOOT_DAY_FILE, "w");
+    if (!wf) {
+      sleep(1);
+      continue;
+    }
+    fprintf(wf, "%s %d\n", day, count);
+    fclose(wf);
+
+    FILE *rf = fopen(OUTAGE_REBOOT_DAY_FILE, "r");
+    if (!rf) {
+      sleep(1);
+      continue;
+    }
+    char got_day[16] = {0};
+    int got_cnt = 0;
+    int ok = fscanf(rf, "%15s %d", got_day, &got_cnt) == 2 &&
+             strcmp(got_day, day) == 0 && got_cnt == count;
+    fclose(rf);
+    if (ok) {
+      unlink(OUTAGE_REBOOT_PENDING_FILE);
+      printf("[Watchdog] TOTAL: commit escalate reboot budget (%d/%d day=%s)\n",
+             count, TOTAL_REBOOT_MAX_DAY, day);
+      return 0;
+    }
+    sleep(1);
+  }
+  printf("[Watchdog] TOTAL: commit escalate reboot budget FAILED day=%s count=%d\n",
+         day, count);
+  return -1;
+}
+
+static int outage_in_escalate_window(void) {
+  time_t now = time(NULL);
+  if (now == (time_t)-1 || g_outage_boot_ts == 0)
+    return 0;
+  return now < g_outage_boot_ts + TOTAL_ESCALATE_WINDOW_S;
+}
+
+static int outage_partial_grace_active(void) {
+  FILE *f = fopen(OUTAGE_PARTIAL_GRACE_FILE, "r");
+  if (!f)
+    return 0;
+  long gs = 0;
+  if (fscanf(f, "%ld", &gs) != 1) {
+    fclose(f);
+    return 0;
+  }
+  fclose(f);
+  time_t now = time(NULL);
+  if (now == (time_t)-1)
+    return 0;
+  return now < (time_t)(gs + PARTIAL_GRACE_S);
+}
+
+static void outage_partial_grace_clear_if_usb_ok(void) {
+  if (access(OUTAGE_PARTIAL_GRACE_FILE, F_OK) != 0)
+    return;
+  if (outage_usb0_has_inet()) {
+    unlink(OUTAGE_PARTIAL_GRACE_FILE);
+    printf("[Watchdog] PARTIAL grace cleared - usb0 inet ready\n");
+  }
+}
+
+static int outage_write_pending(const char *day, const char *kind, int streak) {
+  FILE *f = fopen(OUTAGE_REBOOT_PENDING_FILE, "w");
+  if (!f)
+    return -1;
+  fprintf(f, "%s pending %s streak=%d\n", day, kind, streak);
+  fclose(f);
+  return 0;
+}
+
+static void outage_write_partial_grace(void) {
+  time_t now = time(NULL);
+  if (now == (time_t)-1)
+    return;
+  FILE *f = fopen(OUTAGE_PARTIAL_GRACE_FILE, "w");
+  if (!f)
+    return;
+  fprintf(f, "%ld\n", (long)now);
+  fclose(f);
+}
+
+static void outage_try_total_escalate_reboot(void) {
+  if (access("/mnt/data/need-usb-renum", F_OK) == 0) {
+    printf("[Watchdog] TOTAL: escalate deferred - waiting USB renum (streak=%d)\n",
+           g_total_streak);
+    return;
+  }
+  if (outage_partial_grace_active()) {
+    printf("[Watchdog] TOTAL: escalate deferred - PARTIAL grace active (streak=%d)\n",
+           g_total_streak);
+    return;
+  }
+  if (!outage_usb0_has_inet() && outage_total_reboot_count_today() >= 1) {
+    printf("[Watchdog] TOTAL: escalate deferred - usb0 no inet after spend (streak=%d)\n",
+           g_total_streak);
+    return;
+  }
+  if (!outage_in_escalate_window()) {
+    printf("[Watchdog] TOTAL: escalate skipped - outside window %ds (streak=%d)\n",
+           TOTAL_ESCALATE_WINDOW_S, g_total_streak);
+    return;
+  }
+  if (access(OUTAGE_REBOOT_PENDING_FILE, F_OK) == 0) {
+    printf("[Watchdog] TOTAL: escalate skipped - pending exists (streak=%d)\n",
+           g_total_streak);
+    return;
+  }
+  char day[16];
+  outage_budget_accounting_day(day, sizeof(day));
+  int count = outage_total_reboot_count_today();
+  if (count >= TOTAL_REBOOT_MAX_DAY) {
+    printf("[Watchdog] TOTAL: reboot budget exhausted (%d/%d day=%s)\n", count,
+           TOTAL_REBOOT_MAX_DAY, day);
+    return;
+  }
+  if (outage_write_pending(day, "streak", g_total_streak) != 0)
+    return;
+  printf("[Watchdog] TOTAL: escalate soft reboot need-usb-renum (streak=%d pending->%d/%d)\n",
+         g_total_streak, count + 1, TOTAL_REBOOT_MAX_DAY);
+  sync();
+  sleep(2);
+  device_reboot();
+}
+
+static void outage_try_partial_escalate_reboot(void) {
+  if (access(OUTAGE_REBOOT_PENDING_FILE, F_OK) == 0) {
+    printf("[Watchdog] PARTIAL: escalate skipped - pending exists (streak=%d)\n",
+           g_partial_streak);
+    return;
+  }
+  char day[16];
+  outage_budget_accounting_day(day, sizeof(day));
+  int count = outage_total_reboot_count_today();
+  if (count >= TOTAL_REBOOT_MAX_DAY) {
+    printf("[Watchdog] PARTIAL: reboot budget exhausted (%d/%d day=%s streak=%d)\n",
+           count, TOTAL_REBOOT_MAX_DAY, day, g_partial_streak);
+    return;
+  }
+  if (outage_write_pending(day, "partial", g_partial_streak) != 0)
+    return;
+  printf("[Watchdog] PARTIAL: escalate soft reboot need-usb-renum (streak=%d pending->%d/%d)\n",
+         g_partial_streak, count + 1, TOTAL_REBOOT_MAX_DAY);
+  outage_write_partial_grace();
+  sync();
+  sleep(2);
+  device_reboot();
+}
+
+static void outage_watchdog_tick(void) {
+  int gw = outage_has_gateway();
+  int dhcp = outage_dhcp_ok();
+  int net = ofono_egress_reachable();
+  int cell = outage_cell_active();
+  time_t now = time(NULL);
+  int in_grace =
+      g_outage_boot_ts != 0 && now != (time_t)-1 &&
+      now < g_outage_boot_ts + OUTAGE_BOOT_GRACE_S;
+
+  if (gw)
+    outage_partial_grace_clear_if_usb_ok();
+
+  if (!gw || !dhcp) {
+    g_total_streak++;
+    g_partial_streak = 0;
+    printf("[Watchdog] TOTAL gw=%d dhcp=%d streak=%d grace=%d\n", gw, dhcp,
+           g_total_streak, in_grace);
+
+    if (in_grace) {
+      system("touch /tmp/usb-tether-refresh 2>/dev/null");
+    } else if (outage_total_reboot_budget_exhausted()) {
+      if (g_total_streak == TOTAL_REBOOT_STREAK ||
+          (g_total_streak % TOTAL_REBOOT_STREAK) == 0) {
+        printf("[Watchdog] TOTAL: budget exhausted - skip repair (streak=%d)\n",
+               g_total_streak);
+      }
+    } else {
+      if (outage_total_due(g_total_streak, 2, OUTAGE_TOTAL_LIGHT_EVERY)) {
+        system("touch /tmp/usb-tether-refresh 2>/dev/null");
+        system("touch /tmp/usb-tether-force-repair 2>/dev/null");
+        printf("[Watchdog] TOTAL: light repair (streak=%d)\n", g_total_streak);
+      }
+      if (outage_total_due(g_total_streak, 6, OUTAGE_TOTAL_UDC_EVERY)) {
+        printf("[Watchdog] TOTAL: udc/fix-rndis (streak=%d)\n", g_total_streak);
+        system("touch /tmp/usb-tether-force-repair 2>/dev/null");
+        (void)usb_mode_ensure_rndis_link();
+      }
+      if (g_total_streak == TOTAL_REBOOT_STREAK ||
+          g_total_streak == TOTAL_REBOOT_STREAK * 2) {
+        outage_try_total_escalate_reboot();
+      }
+    }
+  } else if (!net) {
+    g_partial_streak++;
+    g_total_streak = 0;
+
+    if (g_partial_streak < OUTAGE_PARTIAL_ACT_STREAK) {
+      printf("[Watchdog] PARTIAL_BLIP gw=1 net=0 cell=%d streak=%d\n", cell,
+             g_partial_streak);
+    } else {
+      printf("[Watchdog] PARTIAL gw=1 net=0 cell=%d streak=%d\n", cell,
+             g_partial_streak);
+
+      if (g_partial_streak == OUTAGE_PARTIAL_ACT_STREAK)
+        system("touch /tmp/usb-tether-refresh 2>/dev/null");
+
+      if (g_partial_streak == PARTIAL_BOUNCE_STREAK ||
+          g_partial_streak == PARTIAL_BOUNCE_RETRY) {
+        int br = ofono_bounce_pdp();
+        if (br == -2)
+          g_partial_bounce_retry_pending = 1;
+        else if (br == 0)
+          g_partial_bounce_count++;
+      } else if (g_partial_bounce_retry_pending &&
+                 g_partial_streak >= PARTIAL_BOUNCE_STREAK &&
+                 g_partial_streak < PARTIAL_REBOOT_STREAK) {
+        int br = ofono_bounce_pdp();
+        if (br != -2) {
+          g_partial_bounce_count++;
+          g_partial_bounce_retry_pending = 0;
+        }
+      }
+
+      if (g_partial_streak == PARTIAL_REBOOT_STREAK) {
+        if (outage_total_reboot_budget_exhausted()) {
+          printf("[Watchdog] PARTIAL: budget exhausted - skip reboot (streak=%d)\n",
+                 g_partial_streak);
+        } else {
+          outage_try_partial_escalate_reboot();
+        }
+      }
+    }
+  } else {
+    if (g_total_streak > 0 || g_partial_streak > 0) {
+      printf("[Watchdog] RECOVERED gw=%d dhcp=%d net=%d\n", gw, dhcp, net);
+    }
+    g_total_streak = 0;
+    g_partial_streak = 0;
+    g_partial_bounce_count = 0;
+    g_partial_bounce_retry_pending = 0;
+  }
+}
+
 /**
  * Watchdog 线程函数
  */
@@ -1673,13 +2050,21 @@ static void *data_watchdog_thread(void *arg) {
   (void)arg;
   char status[256];
 
-  printf("[Watchdog] 数据连接监控线程已启动 (间隔: %d秒)\n",
-         g_watchdog_interval);
+  g_outage_boot_ts = time(NULL);
+  g_partial_streak = 0;
+  g_total_streak = 0;
+  g_partial_bounce_count = 0;
+  g_partial_bounce_retry_pending = 0;
+  outage_commit_pending_reboot_budget();
+
+  printf("[Watchdog] 数据连接监控线程已启动 (间隔: %d秒, PARTIAL bounce@%d/%d reboot@%d, TOTAL reboot@%d)\n",
+         g_watchdog_interval, PARTIAL_BOUNCE_STREAK, PARTIAL_BOUNCE_RETRY,
+         PARTIAL_REBOOT_STREAK, TOTAL_REBOOT_STREAK);
 
   while (g_watchdog_running) {
-    /* 检查并恢复数据连接 */
+    outage_watchdog_tick();
+
     if (ofono_check_and_restore_data(status, sizeof(status)) >= 0) {
-      /* 只在状态变化时打印日志 */
       if (strcmp(status, g_last_watchdog_status) != 0) {
         printf("[Watchdog] %s\n", status);
         strncpy(g_last_watchdog_status, status,
@@ -1687,7 +2072,6 @@ static void *data_watchdog_thread(void *arg) {
       }
     }
 
-    /* 等待下一次检查 */
     for (int i = 0; i < g_watchdog_interval && g_watchdog_running; i++) {
       sleep(1);
     }
