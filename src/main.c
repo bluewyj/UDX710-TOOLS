@@ -96,8 +96,12 @@ static void ensure_usb_tether_daemon(void) {
   /* #endregion */
 }
 
+#define SERVER_HOME "/home/root/6677"
+
 int main(int argc, char *argv[]) {
   const char *port = "80";
+  char cwd_before[256] = {0};
+  char cwd_after[256] = {0};
 
   /* 解析命令行参数：init 曾传字面量 "boot"（非端口），映射到生产端口 80 */
   if (argc > 1 && argv[1] && argv[1][0] != '\0') {
@@ -108,6 +112,33 @@ int main(int argc, char *argv[]) {
   }
 
   printf("=== ofono-server (C version) ===\n");
+
+  /*
+   * 6677-boot 以 CWD=/ 启动 server；静态页在 ./dist。未 chdir 时
+   * boot→80 能监听但主页 404。统一切到安装目录后再开 HTTP/DB。
+   */
+  if (getcwd(cwd_before, sizeof(cwd_before)) == NULL)
+    snprintf(cwd_before, sizeof(cwd_before), "?");
+  if (chdir(SERVER_HOME) != 0) {
+    fprintf(stderr, "警告: chdir %s 失败: 静态页/DB 可能不可用\n", SERVER_HOME);
+    /* #region agent log */
+    debug_aa8e5b_log("H", "main.c:chdir", "chdir failed",
+                     "{\"path\":\"/home/root/6677\"}");
+    /* #endregion */
+  } else {
+    if (getcwd(cwd_after, sizeof(cwd_after)) == NULL)
+      snprintf(cwd_after, sizeof(cwd_after), SERVER_HOME);
+    printf("[boot] cwd %s -> %s\n", cwd_before, cwd_after);
+    /* #region agent log */
+    {
+      char data[320];
+      snprintf(data, sizeof(data),
+               "{\"before\":\"%s\",\"after\":\"%s\",\"port\":\"%s\"}", cwd_before,
+               cwd_after, port);
+      debug_aa8e5b_log("H", "main.c:chdir", "chdir ok", data);
+    }
+    /* #endregion */
+  }
 
   /* 同步系统时间 */
   system("ntpdate ntp.aliyun.com > /dev/null 2>&1 &");
