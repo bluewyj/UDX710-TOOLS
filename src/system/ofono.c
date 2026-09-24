@@ -1846,7 +1846,10 @@ int ofono_egress_reachable_fresh(int timeout_ms) {
 
   pthread_mutex_lock(&g_egress_cache_mutex);
   g_egress_valid = 0;
-  wait_for = g_egress_generation + 1;
+  /* post-invalidate: if refresh in-flight, wait one extra generation so we
+   * do not accept a ping round that started before invalidate (e.g. during
+   * bounce PDP-down sleeps). Kick still schedules a post-invalidate round. */
+  wait_for = g_egress_generation + 1 + (g_egress_refreshing ? 1 : 0);
   egress_probe_kick_locked();
   egress_deadline_from_now(&deadline, timeout_ms);
 
