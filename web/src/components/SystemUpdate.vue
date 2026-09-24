@@ -192,8 +192,13 @@ async function startUpdate() {
     installProgress.value = 100
     addLog('✓ ' + t('update.installComplete'))
     if (installRes.output) addLog(t('update.output') + ': ' + installRes.output)
-    addLog(t('update.deviceRebooting'))
-    
+    if (installRes.rebooting) {
+      addLog(t('update.deviceRebooting'))
+    } else {
+      addLog(t('update.installSuccess'))
+      // refresh version without waiting for reboot
+      await fetchCurrentVersion()
+    }
     success(t('update.updateSuccess'))
     
   } catch (e) {

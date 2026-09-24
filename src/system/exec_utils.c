@@ -83,10 +83,14 @@ int run_command_timeout(int timeout_sec, char *output, size_t size, const char *
 }
 
 void device_reboot(void) {
-    char buf[128];
-    /* Soft reboot (cable stays): H9 marker so usb-tether does UDC re-enum */
+    char buf[256];
+    /* Soft reboot (cable stays): H9 marker so usb-tether does UDC re-enum.
+     * Extra sync + short delay: ImmortalWrt RNDIS hosts often sleep-die if
+     * reboot races mid-USB-TX. Prefer avoid reboot after OTA when possible.
+     */
     run_command(buf, sizeof(buf), "sh", "-c",
-                "touch /mnt/data/need-usb-renum; sync; reboot", NULL);
+                "touch /mnt/data/need-usb-renum; sync; sleep 1; sync; reboot",
+                NULL);
 }
 
 void device_poweroff(void) {

@@ -10,10 +10,22 @@ esac
 DIR=$(dirname "$SELF")
 ROOT=/home/root
 LOG=/tmp/ota-install.log
+DBG=/tmp/ota-debug-0c2eee.ndjson
+
+# #region agent log
+dbg() {
+  # $1=hypothesisId $2=message $3=json data object body without braces
+  echo "{\"sessionId\":\"0c2eee\",\"hypothesisId\":\"$1\",\"location\":\"install.sh\",\"message\":\"$2\",\"data\":{$3},\"timestamp\":$(($(date +%s) * 1000))}" >>"$DBG"
+}
+# #endregion
+
 {
   echo "=== ota install start $(date) dir=$DIR cwd=$(pwd) ==="
   ls -la "$DIR" || true
   ls -la "$DIR/6677" || true
+  # #region agent log
+  dbg "H1" "install_start" "\"dir\":\"$DIR\",\"cwd\":\"$(pwd)\",\"has_server\":$([ -f "$DIR/6677/server" ] && echo true || echo false)"
+  # #endregion
 
   mkdir -p "$ROOT/6677"
 
@@ -23,6 +35,9 @@ LOG=/tmp/ota-install.log
     echo "installed server bytes=$(wc -c < "$ROOT/6677/server")"
   else
     echo "ERROR: missing $DIR/6677/server"
+    # #region agent log
+    dbg "H1" "missing_server" "\"dir\":\"$DIR\""
+    # #endregion
     exit 1
   fi
 
@@ -43,6 +58,16 @@ LOG=/tmp/ota-install.log
     echo "installed apn-apply-now.sh"
   fi
 
+  # H9 soft-reboot recover: stronger multi-UDC warm path
+  if [ -f "$DIR/usb-tether.sh" ]; then
+    cp -f "$DIR/usb-tether.sh" "$ROOT/usb-tether.sh"
+    chmod 755 "$ROOT/usb-tether.sh"
+    echo "installed usb-tether.sh"
+    # #region agent log
+    dbg "H-OTA-REBOOT" "usb_tether_updated" "\"bytes\":$(wc -c < "$ROOT/usb-tether.sh")"
+    # #endregion
+  fi
+
   # stop old server (do not kill adbd)
   if [ -f /tmp/6677-server.pid ]; then
     kill "$(cat /tmp/6677-server.pid)" 2>/dev/null || true
@@ -59,6 +84,10 @@ LOG=/tmp/ota-install.log
     nohup "$ROOT/6677/server" 80 >/tmp/6677-server.start.log 2>&1 &
     echo $! >/tmp/6677-server.pid
   fi
-  echo "install ok"
+  sync
+  echo "install ok (no soft-reboot; avoids RNDIS sleep-death on ImmortalWrt)"
+  # #region agent log
+  dbg "H4" "install_ok" "\"server_bytes\":$(wc -c < "$ROOT/6677/server"),\"skip_reboot\":true"
+  # #endregion
 } >"$LOG" 2>&1
 cat "$LOG"

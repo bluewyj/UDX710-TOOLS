@@ -807,6 +807,8 @@ void handle_sms_fix_set(struct mg_connection *c, struct mg_http_message *hm) {
 
 /* ==================== OTA更新 API ==================== */
 #include "update.h"
+#include <time.h>
+#include <unistd.h>
 
 /* GET /api/update/version - 获取当前版本 */
 void handle_update_version(struct mg_connection *c,
@@ -891,24 +893,66 @@ void handle_update_extract(struct mg_connection *c,
   }
 }
 
-/* POST /api/update/install - 执行安装并重启 */
+/* POST /api/update/install - 执行安装（默认不软重启）
+ *
+ * ImmortalWrt/RNDIS 上软重启（线不拔）会睡死：USB 仍枚举但 ARP/IP 不通、
+ * 主机侧 TX watchdog。应用包 install.sh 已重启 6677，无需整机 reboot。
+ * 仅当请求体 {"reboot":true} 时才走 device_reboot（仍会写 need-usb-renum）。
+ */
 void handle_update_install(struct mg_connection *c,
                            struct mg_http_message *hm) {
   HTTP_CHECK_POST(c, hm);
 
   char output[2048] = {0};
+  int want_reboot = 0;
+  bool reboot_flag = false;
+  if (mg_json_get_bool(hm->body, "$.reboot", &reboot_flag) && reboot_flag) {
+    want_reboot = 1;
+  }
+
+  // #region agent log
+  {
+    FILE *df = fopen("/tmp/ota-debug-0c2eee.ndjson", "a");
+    if (df) {
+      fprintf(df,
+              "{\"sessionId\":\"0c2eee\",\"hypothesisId\":\"H-OTA-REBOOT\","
+              "\"location\":\"handlers.c:update_install\",\"message\":\"install_begin\","
+              "\"data\":{\"want_reboot\":%d},\"timestamp\":%ld}\n",
+              want_reboot, (long)time(NULL) * 1000L);
+      fclose(df);
+    }
+  }
+  // #endregion
 
   if (update_install(output, sizeof(output)) == 0) {
     JsonBuilder *j = json_new();
     json_obj_open(j);
     json_add_str(j, "status", "success");
-    json_add_str(j, "message", "安装成功，正在重启...");
+    json_add_str(j, "message",
+                 want_reboot ? "安装成功，正在重启..."
+                             : "安装成功，服务已热重启（未整机重启，避免 RNDIS 睡死）");
     json_add_str(j, "output", output);
+    json_add_bool(j, "rebooting", want_reboot ? true : false);
     json_obj_close(j);
     HTTP_OK_FREE(c, json_finish(j));
-    c->is_draining = 1;
-    sleep(2);
-    device_reboot();
+    // #region agent log
+    {
+      FILE *df = fopen("/tmp/ota-debug-0c2eee.ndjson", "a");
+      if (df) {
+        fprintf(df,
+                "{\"sessionId\":\"0c2eee\",\"hypothesisId\":\"H-OTA-REBOOT\","
+                "\"location\":\"handlers.c:update_install\",\"message\":\"install_ok\","
+                "\"data\":{\"want_reboot\":%d},\"timestamp\":%ld}\n",
+                want_reboot, (long)time(NULL) * 1000L);
+        fclose(df);
+      }
+    }
+    // #endregion
+    if (want_reboot) {
+      c->is_draining = 1;
+      sleep(2);
+      device_reboot();
+    }
   } else {
     JsonBuilder *j = json_new();
     json_obj_open(j);
