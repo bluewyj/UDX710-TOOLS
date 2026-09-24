@@ -145,6 +145,13 @@ typedef struct {
  */
 int apn_template_get_status(int id, ApnTemplateStatus *status);
 
+/**
+ * APN 开机 boot 应用（对齐 apn-boot-apply.sh）
+ * @param mode "full" | "persist-only" | "reactivate-only" | "bounce-pdp"
+ * @return 成功返回 0，失败返回 -1；persist-only 异步启动返回 0
+ */
+int apn_boot_apply(const char *mode);
+
 #ifdef __cplusplus
 }
 #endif

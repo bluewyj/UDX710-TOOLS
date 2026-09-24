@@ -69,6 +69,12 @@ int usb_mode_switch_advanced(int mode);
  */
 int usb_mode_get_current_hardware(void);
 
+/**
+ * @brief 启动/运行时确保 RNDIS class ef/04/01（必要时 UDC 解绑→写入→重绑）
+ * @return 0成功或已正确, 负数失败
+ */
+int usb_mode_ensure_rndis_link(void);
+
 /* HTTP API处理函数 */
 void handle_usb_mode_get(struct mg_connection *c, struct mg_http_message *hm);
 void handle_usb_mode_set(struct mg_connection *c, struct mg_http_message *hm);

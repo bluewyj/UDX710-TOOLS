@@ -125,7 +125,20 @@ export default {
     qqGroup: 'QQ Group',
     cacheCleared: 'Cache cleared successfully',
     cacheClearFailed: 'Failed to clear cache',
-    confirmClearCache: 'Are you sure to clear system cache?'
+    confirmClearCache: 'Are you sure to clear system cache?',
+    watchdogTitle: 'Self-heal Watchdog',
+    watchdogSubtitle: 'Observability (read-only)',
+    watchdogRunning: 'Running',
+    watchdogPartialStreak: 'Partial streak',
+    watchdogTotalStreak: 'Total streak',
+    watchdogRebootBudget: 'Reboot budget',
+    watchdogPending: 'Pending',
+    watchdogStatus: 'Status',
+    watchdogYes: 'Yes',
+    watchdogNo: 'No',
+    watchdogLoading: 'Loading watchdog status...',
+    watchdogFetchError: 'Unable to fetch watchdog status',
+    watchdogStale: 'Refresh failed; showing last data'
   },
 
   // Network
