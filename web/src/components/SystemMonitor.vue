@@ -1,7 +1,7 @@
 <script setup>
 import { inject, computed, ref, onMounted, onUnmounted, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { clearCache, getCurrentBand } from '../composables/useApi'
+import { authFetch, clearCache, getCurrentBand } from '../composables/useApi'
 import { useToast } from '../composables/useToast'
 import { useConfirm } from '../composables/useConfirm'
 
@@ -12,6 +12,41 @@ const { confirm } = useConfirm()
 const systemInfo = inject('systemInfo')
 const loading = inject('loading')
 const clearingCache = ref(false)
+
+// 自愈看门狗可观测性快照（只读轮询）
+const watchdog = ref(null)
+const watchdogError = ref(false)
+const watchdogLoading = ref(false)
+
+async function fetchWatchdog() {
+  if (watchdogLoading.value) return
+  watchdogLoading.value = true
+  try {
+    const res = await authFetch('/api/watchdog')
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const json = await res.json()
+    const data = json?.data ?? json
+    if (data && typeof data === 'object') {
+      watchdog.value = data
+      watchdogError.value = false
+    } else {
+      throw new Error('invalid payload')
+    }
+  } catch (err) {
+    console.error('获取看门狗快照失败:', err)
+    // 保留上次成功数据；仅轻量标记错误，不打断整页
+    watchdogError.value = true
+  } finally {
+    watchdogLoading.value = false
+  }
+}
+
+const watchdogRebootBudget = computed(() => {
+  if (!watchdog.value) return '—'
+  const used = watchdog.value.reboot_used ?? 0
+  const max = watchdog.value.reboot_max ?? 0
+  return `${used} / ${max}`
+})
 
 // IMEI/ICCID 显示控制
 const showImei = ref(false)
@@ -47,16 +82,20 @@ async function fetchCurrentBand() {
   bandLoading.value = false
 }
 
-// 定时刷新频段信息
+// 定时刷新频段信息 + 看门狗快照
 let bandTimer = null
+let watchdogTimer = null
 onMounted(async () => {
   await nextTick()
   fetchCurrentBand()
+  fetchWatchdog()
   bandTimer = setInterval(fetchCurrentBand, 10000)
+  watchdogTimer = setInterval(fetchWatchdog, 8000)
 })
 
 onUnmounted(() => {
   if (bandTimer) clearInterval(bandTimer)
+  if (watchdogTimer) clearInterval(watchdogTimer)
 })
 
 // 信号强度等级计算（返回1-4）
@@ -499,6 +538,73 @@ async function handleClearCache() {
             </div>
           </div>
         </div>
+      </div>
+    </div>
+
+    <!-- 自愈看门狗可观测性（只读，无强制重启/翻转按钮） -->
+    <div class="rounded-3xl bg-white/95 dark:bg-white/5 backdrop-blur-xl border border-slate-200/60 dark:border-white/10 p-6 shadow-xl shadow-slate-200/40 dark:shadow-black/20 hover:shadow-2xl hover:shadow-slate-300/50 dark:hover:shadow-black/30 transition-all duration-500">
+      <div class="flex items-center justify-between mb-6">
+        <div class="flex items-center space-x-3">
+          <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-teal-500 to-emerald-500 flex items-center justify-center">
+            <i class="fas fa-shield-alt text-white"></i>
+          </div>
+          <div>
+            <h3 class="text-slate-800 dark:text-white font-bold">{{ t('monitor.watchdogTitle') }}</h3>
+            <p class="text-slate-500 dark:text-white/50 text-xs">{{ t('monitor.watchdogSubtitle') }}</p>
+          </div>
+        </div>
+        <div class="flex items-center space-x-2">
+          <span v-if="watchdogError && watchdog"
+            class="text-xs text-amber-600 dark:text-amber-400 px-2 py-1 rounded-lg bg-amber-500/10 border border-amber-500/20">
+            {{ t('monitor.watchdogStale') }}
+          </span>
+          <button @click="fetchWatchdog" :disabled="watchdogLoading"
+            class="px-3 py-2 bg-slate-100 dark:bg-white/10 text-slate-700 dark:text-white/80 text-sm rounded-xl hover:bg-slate-200 dark:hover:bg-white/20 transition-all border border-slate-200 dark:border-white/10">
+            <font-awesome-icon v-if="watchdogLoading" icon="spinner" spin />
+            <font-awesome-icon v-else icon="sync-alt" />
+          </button>
+        </div>
+      </div>
+
+      <div v-if="watchdog" class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-2 sm:gap-3">
+        <div class="p-3 bg-slate-100 dark:bg-white/5 rounded-xl border border-slate-200 dark:border-white/5">
+          <p class="text-slate-600 dark:text-white/50 text-[10px] sm:text-xs mb-1">{{ t('monitor.watchdogRunning') }}</p>
+          <p class="font-bold text-sm sm:text-base" :class="watchdog.running ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-500 dark:text-white/50'">
+            {{ watchdog.running ? t('monitor.watchdogYes') : t('monitor.watchdogNo') }}
+          </p>
+        </div>
+        <div class="p-3 bg-slate-100 dark:bg-white/5 rounded-xl border border-slate-200 dark:border-white/5">
+          <p class="text-slate-600 dark:text-white/50 text-[10px] sm:text-xs mb-1">{{ t('monitor.watchdogPartialStreak') }}</p>
+          <p class="text-slate-800 dark:text-white font-bold text-sm sm:text-base font-mono">{{ watchdog.partial_streak ?? 0 }}</p>
+        </div>
+        <div class="p-3 bg-slate-100 dark:bg-white/5 rounded-xl border border-slate-200 dark:border-white/5">
+          <p class="text-slate-600 dark:text-white/50 text-[10px] sm:text-xs mb-1">{{ t('monitor.watchdogTotalStreak') }}</p>
+          <p class="text-slate-800 dark:text-white font-bold text-sm sm:text-base font-mono">{{ watchdog.total_streak ?? 0 }}</p>
+        </div>
+        <div class="p-3 bg-slate-100 dark:bg-white/5 rounded-xl border border-slate-200 dark:border-white/5">
+          <p class="text-slate-600 dark:text-white/50 text-[10px] sm:text-xs mb-1">{{ t('monitor.watchdogRebootBudget') }}</p>
+          <p class="text-slate-800 dark:text-white font-bold text-sm sm:text-base font-mono">{{ watchdogRebootBudget }}</p>
+        </div>
+        <div class="p-3 bg-slate-100 dark:bg-white/5 rounded-xl border border-slate-200 dark:border-white/5">
+          <p class="text-slate-600 dark:text-white/50 text-[10px] sm:text-xs mb-1">{{ t('monitor.watchdogPending') }}</p>
+          <p class="font-bold text-sm sm:text-base" :class="watchdog.pending ? 'text-amber-600 dark:text-amber-400' : 'text-slate-500 dark:text-white/50'">
+            {{ watchdog.pending ? t('monitor.watchdogYes') : t('monitor.watchdogNo') }}
+          </p>
+        </div>
+        <div class="p-3 bg-slate-100 dark:bg-white/5 rounded-xl border border-slate-200 dark:border-white/5 col-span-2 md:col-span-3 lg:col-span-1">
+          <p class="text-slate-600 dark:text-white/50 text-[10px] sm:text-xs mb-1">{{ t('monitor.watchdogStatus') }}</p>
+          <p class="text-slate-800 dark:text-white font-medium text-xs sm:text-sm break-words" :title="watchdog.status || ''">
+            {{ watchdog.status || '—' }}
+          </p>
+        </div>
+      </div>
+
+      <div v-else-if="watchdogError" class="text-center py-6">
+        <p class="text-slate-500 dark:text-white/50 text-sm">{{ t('monitor.watchdogFetchError') }}</p>
+      </div>
+      <div v-else class="text-center py-6">
+        <font-awesome-icon icon="spinner" spin class="text-teal-500 mb-2" />
+        <p class="text-slate-500 dark:text-white/50 text-sm">{{ t('monitor.watchdogLoading') }}</p>
       </div>
     </div>
 
