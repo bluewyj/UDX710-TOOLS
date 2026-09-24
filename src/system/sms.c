@@ -435,7 +435,7 @@ int sms_init(const char *db_path) {
     /* 未设置 TZ 时默认 Asia/Shanghai，供 webhook #{time}/localtime 使用 */
     tz = getenv("TZ");
     if (tz == NULL || tz[0] == '\0') {
-        setenv("TZ", "Asia/Shanghai", 0);
+        setenv("TZ", "Asia/Shanghai", 1);
         tzset();
         printf("[SMS] TZ 未设置，默认 Asia/Shanghai\n");
     }
