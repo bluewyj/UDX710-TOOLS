@@ -2259,63 +2259,73 @@ static void outage_watchdog_tick(void) {
   int in_grace =
       g_outage_boot_ts != 0 && now != (time_t)-1 &&
       now < g_outage_boot_ts + OUTAGE_BOOT_GRACE_S;
+  int total_streak;
+  int partial_streak;
+  int had_streak;
 
   if (gw)
     outage_partial_grace_clear_if_usb_ok();
 
   if (!gw || !dhcp) {
+    /* 短临界区：仅改 snap 字段；禁止持锁 system()/reboot */
+    pthread_mutex_lock(&g_watchdog_snap_mutex);
     g_total_streak++;
     g_partial_streak = 0;
+    total_streak = g_total_streak;
+    pthread_mutex_unlock(&g_watchdog_snap_mutex);
     printf("[Watchdog] TOTAL gw=%d dhcp=%d streak=%d grace=%d\n", gw, dhcp,
-           g_total_streak, in_grace);
+           total_streak, in_grace);
 
     if (in_grace) {
       system("touch /tmp/usb-tether-refresh 2>/dev/null");
     } else if (outage_total_reboot_budget_exhausted()) {
-      if (g_total_streak == TOTAL_REBOOT_STREAK ||
-          (g_total_streak % TOTAL_REBOOT_STREAK) == 0) {
+      if (total_streak == TOTAL_REBOOT_STREAK ||
+          (total_streak % TOTAL_REBOOT_STREAK) == 0) {
         printf("[Watchdog] TOTAL: budget exhausted - skip repair (streak=%d)\n",
-               g_total_streak);
+               total_streak);
       }
     } else {
-      if (outage_total_due(g_total_streak, 2, OUTAGE_TOTAL_LIGHT_EVERY)) {
+      if (outage_total_due(total_streak, 2, OUTAGE_TOTAL_LIGHT_EVERY)) {
         system("touch /tmp/usb-tether-refresh 2>/dev/null");
         system("touch /tmp/usb-tether-force-repair 2>/dev/null");
-        printf("[Watchdog] TOTAL: light repair (streak=%d)\n", g_total_streak);
+        printf("[Watchdog] TOTAL: light repair (streak=%d)\n", total_streak);
       }
-      if (outage_total_due(g_total_streak, 6, OUTAGE_TOTAL_UDC_EVERY)) {
-        printf("[Watchdog] TOTAL: udc/fix-rndis (streak=%d)\n", g_total_streak);
+      if (outage_total_due(total_streak, 6, OUTAGE_TOTAL_UDC_EVERY)) {
+        printf("[Watchdog] TOTAL: udc/fix-rndis (streak=%d)\n", total_streak);
         system("touch /tmp/usb-tether-force-repair 2>/dev/null");
         (void)usb_mode_ensure_rndis_link();
       }
-      if (g_total_streak == TOTAL_REBOOT_STREAK ||
-          g_total_streak == TOTAL_REBOOT_STREAK * 2) {
+      if (total_streak == TOTAL_REBOOT_STREAK ||
+          total_streak == TOTAL_REBOOT_STREAK * 2) {
         outage_try_total_escalate_reboot();
       }
     }
   } else if (!net) {
+    pthread_mutex_lock(&g_watchdog_snap_mutex);
     g_partial_streak++;
     g_total_streak = 0;
+    partial_streak = g_partial_streak;
+    pthread_mutex_unlock(&g_watchdog_snap_mutex);
 
-    if (g_partial_streak < OUTAGE_PARTIAL_ACT_STREAK) {
+    if (partial_streak < OUTAGE_PARTIAL_ACT_STREAK) {
       printf("[Watchdog] PARTIAL_BLIP gw=1 net=0 cell=%d streak=%d\n", cell,
-             g_partial_streak);
+             partial_streak);
     } else {
       printf("[Watchdog] PARTIAL gw=1 net=0 cell=%d streak=%d\n", cell,
-             g_partial_streak);
+             partial_streak);
 
-      if (g_partial_streak == OUTAGE_PARTIAL_ACT_STREAK)
+      if (partial_streak == OUTAGE_PARTIAL_ACT_STREAK)
         system("touch /tmp/usb-tether-refresh 2>/dev/null");
 
-      if (g_partial_streak == PARTIAL_BOUNCE_STREAK ||
-          g_partial_streak == PARTIAL_BOUNCE_RETRY) {
+      if (partial_streak == PARTIAL_BOUNCE_STREAK ||
+          partial_streak == PARTIAL_BOUNCE_RETRY) {
         int br = ofono_bounce_pdp();
         if (br == -2)
           g_partial_bounce_retry_pending = 1;
         else if (br == 0)
           g_partial_bounce_count++;
       } else if (g_partial_bounce_retry_pending &&
-                 g_partial_streak == PARTIAL_BOUNCE_RETRY) {
+                 partial_streak == PARTIAL_BOUNCE_RETRY) {
         int br = ofono_bounce_pdp();
         if (br != -2) {
           g_partial_bounce_count++;
@@ -2323,21 +2333,24 @@ static void outage_watchdog_tick(void) {
         }
       }
 
-      if (g_partial_streak == PARTIAL_REBOOT_STREAK) {
+      if (partial_streak == PARTIAL_REBOOT_STREAK) {
         if (outage_total_reboot_budget_exhausted()) {
           printf("[Watchdog] PARTIAL: budget exhausted - skip reboot (streak=%d)\n",
-                 g_partial_streak);
+                 partial_streak);
         } else {
           outage_try_partial_escalate_reboot();
         }
       }
     }
   } else {
-    if (g_total_streak > 0 || g_partial_streak > 0) {
-      printf("[Watchdog] RECOVERED gw=%d dhcp=%d net=%d\n", gw, dhcp, net);
-    }
+    pthread_mutex_lock(&g_watchdog_snap_mutex);
+    had_streak = (g_total_streak > 0 || g_partial_streak > 0);
     g_total_streak = 0;
     g_partial_streak = 0;
+    pthread_mutex_unlock(&g_watchdog_snap_mutex);
+    if (had_streak) {
+      printf("[Watchdog] RECOVERED gw=%d dhcp=%d net=%d\n", gw, dhcp, net);
+    }
     g_partial_bounce_count = 0;
     g_partial_bounce_retry_pending = 0;
   }
@@ -2351,8 +2364,10 @@ static void *data_watchdog_thread(void *arg) {
   char status[256];
 
   g_outage_boot_ts = time(NULL);
+  pthread_mutex_lock(&g_watchdog_snap_mutex);
   g_partial_streak = 0;
   g_total_streak = 0;
+  pthread_mutex_unlock(&g_watchdog_snap_mutex);
   g_partial_bounce_count = 0;
   g_partial_bounce_retry_pending = 0;
   nr_lte_reset_phase1();
@@ -2379,11 +2394,17 @@ static void *data_watchdog_thread(void *arg) {
     }
 
     if (ofono_check_and_restore_data(status, sizeof(status)) >= 0) {
+      int status_changed = 0;
+      pthread_mutex_lock(&g_watchdog_snap_mutex);
       if (strcmp(status, g_last_watchdog_status) != 0) {
-        printf("[Watchdog] %s\n", status);
         strncpy(g_last_watchdog_status, status,
                 sizeof(g_last_watchdog_status) - 1);
+        g_last_watchdog_status[sizeof(g_last_watchdog_status) - 1] = '\0';
+        status_changed = 1;
       }
+      pthread_mutex_unlock(&g_watchdog_snap_mutex);
+      if (status_changed)
+        printf("[Watchdog] %s\n", status);
     }
 
     for (int i = 0; i < g_watchdog_interval && g_watchdog_running; i++) {
@@ -2405,12 +2426,16 @@ int ofono_start_data_watchdog(int interval_secs) {
   }
 
   g_watchdog_interval = (interval_secs > 0) ? interval_secs : 10;
+  pthread_mutex_lock(&g_watchdog_snap_mutex);
   g_watchdog_running = 1;
   g_last_watchdog_status[0] = '\0';
+  pthread_mutex_unlock(&g_watchdog_snap_mutex);
 
   if (pthread_create(&g_watchdog_thread, NULL, data_watchdog_thread, NULL) !=
       0) {
+    pthread_mutex_lock(&g_watchdog_snap_mutex);
     g_watchdog_running = 0;
+    pthread_mutex_unlock(&g_watchdog_snap_mutex);
     printf("[Watchdog] 创建线程失败\n");
     return -1;
   }
@@ -2427,7 +2452,9 @@ void ofono_stop_data_watchdog(void) {
     return;
   }
 
+  pthread_mutex_lock(&g_watchdog_snap_mutex);
   g_watchdog_running = 0;
+  pthread_mutex_unlock(&g_watchdog_snap_mutex);
   /* 线程会在下一次循环时自动退出 */
 }
 
