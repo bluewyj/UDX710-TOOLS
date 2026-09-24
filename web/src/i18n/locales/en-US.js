@@ -759,7 +759,7 @@ export default {
     hotSwitchFailed: 'Hot switch failed',
     restoreSafe: 'Restore Safe RNDIS',
     restoreSafeConfirm: 'Restore Safe RNDIS Confirmation',
-    restoreSafeMsg: 'This will restore permanent RNDIS safe profile (Windows-compatible link settings). Continue?',
+    restoreSafeMsg: 'This will restore permanent RNDIS safe profile (Windows-compatible link settings). The current USB session may briefly disconnect. Continue?',
     restoreSafeOk: 'Restored permanent RNDIS; applied immediately',
     restoreSafeReboot: 'Config written; reboot required to take effect',
     restoreSafeFailed: 'Failed to restore safe RNDIS',

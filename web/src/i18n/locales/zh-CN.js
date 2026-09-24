@@ -758,7 +758,7 @@
     hotSwitchFailed: '热切换失败',
     restoreSafe: '恢复安全 RNDIS',
     restoreSafeConfirm: '恢复安全 RNDIS 确认',
-    restoreSafeMsg: '将恢复为永久 RNDIS 安全档（兼容 Windows 的链路配置）。确定继续吗？',
+    restoreSafeMsg: '将恢复为永久 RNDIS 安全档（兼容 Windows 的链路配置）。当前 USB 会话可能短暂中断，确定继续吗？',
     restoreSafeOk: '已恢复为永久 RNDIS 并立即生效',
     restoreSafeReboot: '配置已写入，重启后生效',
     restoreSafeFailed: '恢复安全 RNDIS 失败',
