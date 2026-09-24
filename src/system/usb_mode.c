@@ -227,6 +227,32 @@ void handle_usb_mode_set(struct mg_connection *c, struct mg_http_message *hm) {
     HTTP_OK_FREE(c, json_finish(j));
 }
 
+/* 恢复永久 RNDIS 安全档：set → switch_advanced → ensure_rndis_link */
+int usb_mode_restore_safe(int *applied_immediately) {
+    if (applied_immediately)
+        *applied_immediately = 0;
+
+    /* 永久写入 RNDIS 并清除临时覆盖；失败则不热切 */
+    if (usb_mode_set(USB_MODE_RNDIS, 1) != 0) {
+        printf("[usb_mode] restore_safe: set permanent RNDIS failed\n");
+        return -1;
+    }
+
+    /* 热切失败：配置已写入，不回滚，返回需重启 */
+    if (usb_mode_switch_advanced(USB_MODE_RNDIS) != 0) {
+        printf("[usb_mode] restore_safe: hot switch failed, reboot required\n");
+        return 1;
+    }
+
+    /* 热切成功后再次 ensure class（幂等；已是永久 RNDIS 时仍走此路径） */
+    (void)usb_mode_ensure_rndis_link();
+
+    if (applied_immediately)
+        *applied_immediately = 1;
+    printf("[usb_mode] restore_safe: permanent RNDIS applied immediately\n");
+    return 0;
+}
+
 /* ==================== USB 热切换实现 ==================== */
 
 /* 写入 sysfs 文件 */
@@ -253,6 +279,92 @@ static int read_sysfs(const char *path, char *buf, size_t size) {
     /* 去除换行符 */
     char *nl = strchr(buf, '\n');
     if (nl) *nl = '\0';
+    return 0;
+}
+
+/* 1=ef/04/01 已正确, 0=需修正, -1=rndis.gs4 未就绪 */
+static int rndis_class_is_correct(void) {
+    char class_path[256], sub_path[256], proto_path[256];
+    char cur[16], sub[8] = {0}, proto[8] = {0};
+
+    snprintf(class_path, sizeof(class_path), "%s/rndis.gs4/class", USB_FUNCTIONS_PATH);
+    snprintf(sub_path, sizeof(sub_path), "%s/rndis.gs4/subclass", USB_FUNCTIONS_PATH);
+    snprintf(proto_path, sizeof(proto_path), "%s/rndis.gs4/protocol", USB_FUNCTIONS_PATH);
+    if (access(class_path, F_OK) != 0)
+        return -1;
+    if (read_sysfs(class_path, cur, sizeof(cur)) != 0 || strcmp(cur, "ef") != 0)
+        return 0;
+    read_sysfs(sub_path, sub, sizeof(sub));
+    read_sysfs(proto_path, proto, sizeof(proto));
+    if (strcmp(sub, "04") == 0 && strcmp(proto, "01") == 0)
+        return 1;
+    return 0;
+}
+
+/* 对齐 device_dump/home_root/fix-rndis-link.sh（假定 UDC 已解绑或可写） */
+static int usb_mode_ensure_rndis_descriptors(void) {
+    char class_path[256], sub_path[256], proto_path[256], qmult_path[256];
+    int cls = rndis_class_is_correct();
+
+    if (cls < 0) {
+        printf("[usb_mode] rndis.gs4 not ready, skip class fix\n");
+        return 0;
+    }
+    if (cls > 0)
+        return 0;
+
+    snprintf(class_path, sizeof(class_path), "%s/rndis.gs4/class", USB_FUNCTIONS_PATH);
+    snprintf(sub_path, sizeof(sub_path), "%s/rndis.gs4/subclass", USB_FUNCTIONS_PATH);
+    snprintf(proto_path, sizeof(proto_path), "%s/rndis.gs4/protocol", USB_FUNCTIONS_PATH);
+    snprintf(qmult_path, sizeof(qmult_path), "%s/rndis.gs4/qmult", USB_FUNCTIONS_PATH);
+    printf("[usb_mode] force rndis class ef/04/01\n");
+    if (write_sysfs(class_path, "ef") != 0 ||
+        write_sysfs(sub_path, "04") != 0 ||
+        write_sysfs(proto_path, "01") != 0) {
+        printf("[usb_mode] ERROR: failed to write rndis class/subclass/protocol\n");
+        return -1;
+    }
+    (void)write_sysfs(qmult_path, "5");
+    if (access(PAMU3_PROTOCOL_PATH, F_OK) == 0)
+        (void)write_sysfs(PAMU3_PROTOCOL_PATH, "RNDIS");
+    (void)write_sysfs("/sys/devices/platform/soc/soc:ipa/2b300000.pamu3/max_dl_pkts", "7");
+    return 0;
+}
+
+/* 启动时对齐 fix-rndis-link.sh：已正确则 no-op；否则必要时 UDC 周期后写入 */
+int usb_mode_ensure_rndis_link(void) {
+    char udc_cur[64] = {0};
+    int was_bound = 0;
+    int cls = rndis_class_is_correct();
+    int ret;
+
+    if (cls < 0) {
+        printf("[usb_mode] rndis.gs4 not ready, skip rndis link ensure\n");
+        return 0;
+    }
+    if (cls > 0)
+        return 0;
+
+    if (read_sysfs(USB_UDC_PATH, udc_cur, sizeof(udc_cur)) == 0 &&
+        udc_cur[0] != '\0' && strcmp(udc_cur, "none") != 0) {
+        was_bound = 1;
+        printf("[usb_mode] unbind UDC (%s) for rndis class fix\n", udc_cur);
+        if (write_sysfs(USB_UDC_PATH, "none") != 0)
+            return -1;
+        sleep(1);
+    }
+
+    ret = usb_mode_ensure_rndis_descriptors();
+    if (ret != 0)
+        return ret;
+
+    if (was_bound) {
+        printf("[usb_mode] rebind UDC (%s) after rndis class fix\n", udc_cur);
+        if (write_sysfs(USB_UDC_PATH, udc_cur) != 0)
+            return -1;
+        usleep(1000000);
+    }
+
     return 0;
 }
 
@@ -580,6 +692,13 @@ int usb_mode_switch_advanced(int mode) {
     /* 14. 设置日志传输 */
     write_sysfs("/sys/module/slog_bridge/parameters/log_transport", "1");
     
+    /* 14b. RNDIS: force class ef/04/01 before UDC bind */
+    if (mode == USB_MODE_RNDIS) {
+        int ret = usb_mode_ensure_rndis_link();
+        if (ret != 0)
+            return ret;
+    }
+    
     /* 15. 启用 UDC */
     write_sysfs(USB_UDC_PATH, udc_name);
     
@@ -667,4 +786,41 @@ void handle_usb_advance(struct mg_connection *c, struct mg_http_message *hm) {
     if (ret != 0) {
         printf("[usb_mode] 热切换失败: %d\n", ret);
     }
+}
+
+/* POST /api/usb/mode/restore-safe - 恢复永久 RNDIS 安全档 */
+void handle_usb_mode_restore_safe(struct mg_connection *c, struct mg_http_message *hm) {
+    HTTP_CHECK_POST(c, hm);
+
+    int applied_immediately = 0;
+    int ret = usb_mode_restore_safe(&applied_immediately);
+
+    if (ret < 0) {
+        JsonBuilder *j = json_new();
+        json_obj_open(j);
+        json_add_int(j, "Code", 1);
+        json_add_str(j, "Error", "恢复RNDIS安全档失败");
+        json_add_null(j, "Data");
+        json_obj_close(j);
+        HTTP_OK_FREE(c, json_finish(j));
+        return;
+    }
+
+    JsonBuilder *j = json_new();
+    json_obj_open(j);
+    json_add_int(j, "Code", 0);
+    json_add_str(j, "Error", "");
+    json_key_obj_open(j, "Data");
+    json_add_str(j, "mode", "rndis");
+    json_add_bool(j, "permanent", 1);
+    json_add_bool(j, "applied_immediately", applied_immediately);
+    if (applied_immediately) {
+        json_add_str(j, "message", "已恢复为永久RNDIS并立即生效");
+    } else {
+        json_add_str(j, "message", "配置已写入，重启后生效");
+    }
+    json_obj_close(j);
+    json_obj_close(j);
+
+    HTTP_OK_FREE(c, json_finish(j));
 }

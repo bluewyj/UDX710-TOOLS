@@ -336,6 +336,11 @@ export async function usbAdvanceSwitch(mode) {
   })
 }
 
+// 恢复永久 RNDIS 安全档
+export async function restoreSafe(url = '/api/usb/mode/restore-safe') {
+  return request(url, { method: 'POST' })
+}
+
 // ==================== APN配置API ====================
 
 // 获取APN列表

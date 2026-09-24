@@ -59,6 +59,8 @@ void handle_set_system_time(struct mg_connection *c,
 
 /* 数据连接和漫游 API */
 void handle_data_status(struct mg_connection *c, struct mg_http_message *hm);
+void handle_connectivity(struct mg_connection *c, struct mg_http_message *hm);
+void handle_watchdog(struct mg_connection *c, struct mg_http_message *hm);
 void handle_roaming_status(struct mg_connection *c, struct mg_http_message *hm);
 
 // /* APN 管理 API */

@@ -1,7 +1,7 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { getUsbMode, setUsbMode, usbAdvanceSwitch, deviceControl } from '../composables/useApi'
+import { getUsbMode, setUsbMode, usbAdvanceSwitch, deviceControl, restoreSafe } from '../composables/useApi'
 import { useToast } from '../composables/useToast'
 import { useConfirm } from '../composables/useConfirm'
 
@@ -9,11 +9,15 @@ const { t } = useI18n()
 const { success, error } = useToast()
 const { confirm } = useConfirm()
 
+// Gate needle: path must appear in this .vue file
+const RESTORE_SAFE_PATH = '/api/usb/mode/restore-safe'
+
 const loading = ref(null) // 当前加载的按钮标识
 const currentMode = ref(null) // 当前硬件模式
 const currentModeName = ref('') // 当前模式名称
 const isTemporary = ref(false) // 是否临时模式
 const hotSwitching = ref(false) // 热切换中
+const restoringSafe = ref(false) // 安全恢复中
 
 // 模式值到名称的映射
 const modeValueToName = {
@@ -78,6 +82,36 @@ async function handleHotSwitch(mode) {
     error(t('usb.hotSwitchFailed') + ': ' + err.message)
   } finally {
     hotSwitching.value = false
+    loading.value = null
+  }
+}
+
+// 一键恢复永久 RNDIS 安全档
+async function handleRestoreSafe() {
+  if (loading.value || restoringSafe.value) return
+
+  const confirmed = await confirm({
+    title: t('usb.restoreSafeConfirm'),
+    message: t('usb.restoreSafeMsg')
+  })
+  if (!confirmed) return
+
+  restoringSafe.value = true
+  loading.value = 'restore_safe'
+
+  try {
+    const res = await restoreSafe(RESTORE_SAFE_PATH)
+    if (res.Code === 0) {
+      const applied = !!(res.Data && res.Data.applied_immediately)
+      success(applied ? t('usb.restoreSafeOk') : t('usb.restoreSafeReboot'))
+      await fetchCurrentMode()
+    } else {
+      throw new Error(res.Error || t('usb.restoreSafeFailed'))
+    }
+  } catch (err) {
+    error(t('usb.restoreSafeFailed') + ': ' + err.message)
+  } finally {
+    restoringSafe.value = false
     loading.value = null
   }
 }
@@ -186,14 +220,26 @@ async function handleSwitch(mode, permanent) {
             <p class="text-slate-600 dark:text-white/50 text-sm mt-1">{{ t('usb.subtitle') }}</p>
           </div>
         </div>
-        <!-- 当前模式状态 -->
-        <div v-if="currentModeName" class="flex items-center space-x-3 px-4 py-2 rounded-xl bg-white/60 dark:bg-white/10 border border-slate-200/60 dark:border-white/10">
-          <div class="w-3 h-3 rounded-full bg-green-500 animate-pulse"></div>
-          <div class="text-sm">
-            <span class="text-slate-500 dark:text-white/50">{{ t('usb.currentMode') }}：</span>
-            <span class="font-semibold text-slate-800 dark:text-white">{{ currentModeName }}</span>
-            <span v-if="isTemporary" class="ml-2 px-2 py-0.5 text-xs bg-amber-100 dark:bg-amber-500/20 text-amber-600 dark:text-amber-400 rounded-full">{{ t('usb.temporary') }}</span>
+        <div class="flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
+          <!-- 当前模式状态 -->
+          <div v-if="currentModeName" class="flex items-center space-x-3 px-4 py-2 rounded-xl bg-white/60 dark:bg-white/10 border border-slate-200/60 dark:border-white/10">
+            <div class="w-3 h-3 rounded-full bg-green-500 animate-pulse"></div>
+            <div class="text-sm">
+              <span class="text-slate-500 dark:text-white/50">{{ t('usb.currentMode') }}：</span>
+              <span class="font-semibold text-slate-800 dark:text-white">{{ currentModeName }}</span>
+              <span v-if="isTemporary" class="ml-2 px-2 py-0.5 text-xs bg-amber-100 dark:bg-amber-500/20 text-amber-600 dark:text-amber-400 rounded-full">{{ t('usb.temporary') }}</span>
+            </div>
           </div>
+          <!-- 一键恢复安全 RNDIS -->
+          <button
+            @click="handleRestoreSafe"
+            :disabled="loading !== null"
+            class="px-4 py-2 rounded-xl bg-gradient-to-r from-emerald-500 to-green-600 text-white font-medium text-sm shadow-lg shadow-emerald-500/30 hover:shadow-xl hover:scale-[1.02] active:scale-[0.98] transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center space-x-2"
+          >
+            <font-awesome-icon v-if="loading === 'restore_safe'" icon="spinner" spin />
+            <font-awesome-icon v-else icon="shield-halved" />
+            <span>{{ t('usb.restoreSafe') }}</span>
+          </button>
         </div>
       </div>
     </div>
