@@ -287,6 +287,7 @@
     refreshCells: '刷新邻区',
     noCells: '暂无邻区信息',
     selectedBands: '已选 {count} 个频段',
+    bandUnsupported: '模组不支持此频段',
     getBandsFailed: '获取频段失败',
     selectAtLeastOne: '请至少选择一个频段',
     lockedBands: '已锁定 {count} 个频段',

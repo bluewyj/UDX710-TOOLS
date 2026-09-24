@@ -288,6 +288,7 @@ export default {
     refreshCells: 'Refresh Cells',
     noCells: 'No neighbor cells available',
     selectedBands: '{count} bands selected',
+    bandUnsupported: 'Band not supported by modem',
     getBandsFailed: 'Failed to get bands',
     selectAtLeastOne: 'Please select at least one band',
     lockedBands: '{count} bands locked',
