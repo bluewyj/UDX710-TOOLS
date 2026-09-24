@@ -101,6 +101,8 @@
     architecture: '架构',
     uptime: '运行时间',
     temperature: '温度',
+    thermalZones: '温度监控',
+    noThermalData: '暂无温度数据',
     memoryUsage: '内存使用',
     clearCache: '清除缓存',
     clearing: '清除中',

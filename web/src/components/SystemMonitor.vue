@@ -126,6 +126,25 @@ const cpuPercent = computed(() => {
   return Math.round(cpu * 10) / 10
 })
 
+// 温度色阶：<60 绿 / ≥60 黄 / ≥70 红
+function getThermalColor(temp) {
+  if (temp == null || temp < 0) {
+    return { text: 'text-gray-400', bg: 'bg-gray-400', border: 'border-gray-300 dark:border-gray-600' }
+  }
+  if (temp >= 70) {
+    return { text: 'text-red-600 dark:text-red-400', bg: 'bg-red-500', border: 'border-red-300 dark:border-red-500/40' }
+  }
+  if (temp >= 60) {
+    return { text: 'text-yellow-600 dark:text-yellow-400', bg: 'bg-yellow-500', border: 'border-yellow-300 dark:border-yellow-500/40' }
+  }
+  return { text: 'text-green-600 dark:text-green-400', bg: 'bg-green-500', border: 'border-green-300 dark:border-green-500/40' }
+}
+
+function formatThermalTemp(temp) {
+  if (temp == null || temp < 0) return 'N/A'
+  return temp.toFixed(1) + ' °C'
+}
+
 // 格式化速率
 function formatRate(kbps) {
   if (!kbps || kbps === 0) return 'N/A'
@@ -360,6 +379,47 @@ async function handleClearCache() {
       </div>
     </div>
 
+    <!-- 温度监控 - 多传感器网格 -->
+    <div class="rounded-3xl bg-white/95 dark:bg-white/5 backdrop-blur-xl border border-slate-200/60 dark:border-white/10 p-6 shadow-xl shadow-slate-200/40 dark:shadow-black/20 hover:shadow-2xl hover:shadow-slate-300/50 dark:hover:shadow-black/30 transition-all duration-500">
+      <div class="flex items-center space-x-3 mb-6">
+        <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-orange-500 to-red-500 flex items-center justify-center">
+          <i class="fas fa-temperature-high text-white"></i>
+        </div>
+        <h3 class="text-slate-800 dark:text-white font-bold">{{ t('monitor.thermalZones') }}</h3>
+      </div>
+
+      <div v-if="systemInfo?.thermal_zones?.length" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2 sm:gap-3">
+        <div
+          v-for="(zone, index) in systemInfo.thermal_zones"
+          :key="zone.zone || index"
+          class="group relative overflow-hidden p-3 sm:p-4 bg-white/80 dark:bg-white/5 rounded-xl sm:rounded-2xl border transition-all hover:scale-105"
+          :class="getThermalColor(zone.temperature).border"
+        >
+          <div class="relative text-center">
+            <div
+              class="w-10 h-10 sm:w-12 sm:h-12 mx-auto mb-2 rounded-xl flex items-center justify-center shadow-lg"
+              :class="getThermalColor(zone.temperature).bg"
+            >
+              <i class="fas fa-thermometer-half text-white text-sm sm:text-base"></i>
+            </div>
+            <p class="text-slate-600 dark:text-white/50 text-[10px] sm:text-xs mb-0.5 truncate" :title="zone.type">
+              {{ zone.type || zone.zone || 'N/A' }}
+            </p>
+            <p class="font-bold text-base sm:text-lg" :class="getThermalColor(zone.temperature).text">
+              {{ formatThermalTemp(zone.temperature) }}
+            </p>
+            <p v-if="zone.zone" class="text-slate-400 dark:text-white/30 text-[10px] mt-1 truncate">{{ zone.zone }}</p>
+          </div>
+        </div>
+      </div>
+
+      <div v-else class="text-center py-10">
+        <div class="w-16 h-16 mx-auto mb-4 rounded-2xl bg-slate-100 dark:bg-white/10 flex items-center justify-center">
+          <i class="fas fa-temperature-empty text-slate-400 dark:text-white/40 text-2xl"></i>
+        </div>
+        <p class="text-slate-500 dark:text-white/50">{{ t('monitor.noThermalData') }}</p>
+      </div>
+    </div>
 
     <!-- 主要信息区 -->
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
