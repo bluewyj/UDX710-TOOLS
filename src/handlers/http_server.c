@@ -27,6 +27,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+
+#define HTTP_BIND_RETRY_MAX 30
+#define HTTP_BIND_RETRY_SLEEP_S 1
 
 /* 嵌入式文件系统声明 (packed_fs.c) */
 extern int serve_packed_file(struct mg_connection *c,
@@ -60,6 +64,8 @@ static int is_auth_whitelist(const char *uri, const char *method,
   int is_get = (method_len == 3 && memcmp(method, "GET", 3) == 0);
   if (is_get) {
     if (strncmp(uri, "/api/info", 9) == 0)
+      return 1;
+    if (strncmp(uri, "/api/connectivity", 17) == 0)
       return 1;
     if (strncmp(uri, "/api/charge/config", 18) == 0)
       return 1;
@@ -161,6 +167,10 @@ static void http_handler(struct mg_connection *c, int ev, void *ev_data) {
     /* API 路由 */
     if (mg_match(hm->uri, mg_str("/api/info"), NULL)) {
       handle_info(c, hm);
+    } else if (mg_match(hm->uri, mg_str("/api/connectivity"), NULL)) {
+      handle_connectivity(c, hm);
+    } else if (mg_match(hm->uri, mg_str("/api/watchdog"), NULL)) {
+      handle_watchdog(c, hm);
     } else if (mg_match(hm->uri, mg_str("/api/at"), NULL)) {
       handle_execute_at(c, hm);
     } else if (mg_match(hm->uri, mg_str("/api/set_network"), NULL)) {
@@ -514,11 +524,23 @@ int http_server_start(const char *port) {
   /* 构建监听地址 - 使用 0.0.0.0 监听所有IPv4地址 */
   snprintf(listen_addr, sizeof(listen_addr), "http://0.0.0.0:%s", port);
 
-  /* 创建 HTTP 监听器 */
-  if (mg_http_listen(&g_mgr, listen_addr, http_handler, NULL) == NULL) {
-    printf("无法监听端口 %s\n", port);
-    mg_mgr_free(&g_mgr);
-    return -1;
+  /* 创建 HTTP 监听器（短重试，应对端口短暂占用） */
+  {
+    int attempt;
+    struct mg_connection *c = NULL;
+    for (attempt = 1; attempt <= HTTP_BIND_RETRY_MAX; attempt++) {
+      c = mg_http_listen(&g_mgr, listen_addr, http_handler, NULL);
+      if (c != NULL)
+        break;
+      printf("警告: 无法监听端口 %s (尝试 %d/%d)，%d 秒后重试\n", port,
+             attempt, HTTP_BIND_RETRY_MAX, HTTP_BIND_RETRY_SLEEP_S);
+      sleep(HTTP_BIND_RETRY_SLEEP_S);
+    }
+    if (c == NULL) {
+      printf("无法监听端口 %s（已重试 %d 次）\n", port, HTTP_BIND_RETRY_MAX);
+      mg_mgr_free(&g_mgr);
+      return -1;
+    }
   }
 
   printf("Server starting on :%s\n", port);

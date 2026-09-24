@@ -125,7 +125,20 @@
     qqGroup: '官方Q群',
     cacheCleared: '缓存清除成功',
     cacheClearFailed: '清除失败',
-    confirmClearCache: '确定要清除系统缓存吗？'
+    confirmClearCache: '确定要清除系统缓存吗？',
+    watchdogTitle: '自愈看门狗',
+    watchdogSubtitle: '运行态观测（只读）',
+    watchdogRunning: '运行中',
+    watchdogPartialStreak: 'Partial streak',
+    watchdogTotalStreak: 'Total streak',
+    watchdogRebootBudget: '重启预算',
+    watchdogPending: '待处理',
+    watchdogStatus: '状态',
+    watchdogYes: '是',
+    watchdogNo: '否',
+    watchdogLoading: '正在获取看门狗状态...',
+    watchdogFetchError: '暂时无法获取看门狗状态',
+    watchdogStale: '刷新失败，显示上次数据'
   },
 
   // 网络管理模块

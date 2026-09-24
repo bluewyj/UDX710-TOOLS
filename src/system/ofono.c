@@ -8,14 +8,19 @@
  * - oFono 服务调用（网络模式、APN、信号等）
  */
 
+#include "exec_utils.h"
 #include "ofono.h"
 #include "dbus_core.h"
 #include "sysinfo.h"
+#include "usb_mode.h"
+#include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -33,7 +38,10 @@ int ofono_is_data_monitor_running(void);
 /* ==================== 全局变量 ==================== */
 static GDBusConnection *g_dbus_conn = NULL;
 static GDBusProxy *g_modem_proxy = NULL;
-static pthread_mutex_t g_at_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_ofono_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void ofono_lock(void) { pthread_mutex_lock(&g_ofono_mutex); }
+static void ofono_unlock(void) { pthread_mutex_unlock(&g_ofono_mutex); }
 static char g_last_error[512] = {0};
 static char g_modem_path[64] =
     DEFAULT_MODEM_PATH; /* 缓存路径，仅用于 proxy 切换检测 */
@@ -215,19 +223,17 @@ int execute_at(const char *command, char **result) {
     }
   }
 
-  /* 获取互斥锁，确保串行执行 */
-  pthread_mutex_lock(&g_at_mutex);
-
   printf("准备发送 AT 命令: %s\n", command);
 
-  /* 重试逻辑 */
+  /* 重试逻辑：锁只围单次 SendAtcmd；InProgress 等待在锁外 */
   for (retry = 0; retry <= MAX_RETRIES; retry++) {
     error = NULL;
 
-    /* 调用 oFono 的 SendAtcmd 方法 */
+    ofono_lock();
     ret = g_dbus_proxy_call_sync(
         g_modem_proxy, "SendAtcmd", g_variant_new("(s)", command),
         G_DBUS_CALL_FLAGS_NONE, AT_COMMAND_TIMEOUT, NULL, &error);
+    ofono_unlock();
 
     if (!ret) {
       printf("调用 SendAtcmd 失败 (尝试 %d/%d) (%s): %s\n", retry + 1,
@@ -249,7 +255,7 @@ int execute_at(const char *command, char **result) {
       if (error && strstr(error->message, "Operation already in progress")) {
         printf("检测到 'Operation already in progress'，500ms 后重试...\n");
         g_error_free(error);
-        g_usleep(500000); /* 500ms */
+        g_usleep(500000); /* 锁外等待 */
         continue;
       }
 
@@ -276,7 +282,6 @@ int execute_at(const char *command, char **result) {
     break;
   }
 
-  pthread_mutex_unlock(&g_at_mutex);
   return rc;
 }
 
@@ -291,6 +296,37 @@ void ofono_deinit(void) {
     g_object_unref(g_dbus_conn);
     g_dbus_conn = NULL;
   }
+}
+
+int ofono_enable_usb_share_at(void) {
+  const char *dev = "/dev/stty_lte30";
+  const char *at = "AT+SPASENGMD=\"#dsm_usb_share_enable\",1\r";
+  int n;
+
+  for (n = 0; n < 30; n++) {
+    struct stat st;
+    if (stat(dev, &st) == 0 && S_ISCHR(st.st_mode))
+      break;
+    sleep(1);
+  }
+  if (n >= 30) {
+    printf("[USBShare] stty_lte30 missing\n");
+    return -1;
+  }
+
+  for (n = 0; n < 5; n++) {
+    FILE *f = fopen(dev, "w");
+    if (f) {
+      fputs(at, f);
+      fclose(f);
+      printf("[USBShare] AT sent attempt=%d\n", n + 1);
+      return 0;
+    }
+    sleep(2);
+  }
+
+  printf("[USBShare] failed to write AT after 5 attempts\n");
+  return -1;
 }
 
 int ofono_network_get_mode_sync(const char *modem_path, char *buffer, int size,
@@ -318,9 +354,11 @@ int ofono_network_get_mode_sync(const char *modem_path, char *buffer, int size,
     return -1;
   }
 
+  ofono_lock();
   result =
       g_dbus_proxy_call_sync(proxy, "GetProperties", NULL,
                              G_DBUS_CALL_FLAGS_NONE, timeout_ms, NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -435,11 +473,13 @@ int ofono_network_set_mode_sync(const char *modem_path, int mode,
     return -3;
   }
 
+  ofono_lock();
   result =
       g_dbus_proxy_call_sync(proxy, "SetProperty",
                              g_variant_new("(sv)", "TechnologyPreference",
                                            g_variant_new_string(mode_str)),
                              G_DBUS_CALL_FLAGS_NONE, timeout_ms, NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -472,11 +512,13 @@ int ofono_modem_set_online(const char *modem_path, int online, int timeout_ms) {
     return -2;
   }
 
+  ofono_lock();
   result = g_dbus_proxy_call_sync(
       proxy, "SetProperty",
       g_variant_new("(sv)", "Online",
                     g_variant_new_boolean(online ? TRUE : FALSE)),
       G_DBUS_CALL_FLAGS_NONE, timeout_ms, NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -534,9 +576,11 @@ int ofono_network_get_signal_strength(const char *modem_path, int *strength,
     return -2;
   }
 
+  ofono_lock();
   result =
       g_dbus_proxy_call_sync(proxy, "GetProperties", NULL,
                              G_DBUS_CALL_FLAGS_NONE, timeout_ms, NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -618,9 +662,11 @@ static int find_internet_context_path(char *path_buf, size_t buf_size) {
   }
 
   /* 调用 GetContexts 获取所有 context */
+  ofono_lock();
   result =
       g_dbus_proxy_call_sync(proxy, "GetContexts", NULL, G_DBUS_CALL_FLAGS_NONE,
                              OFONO_TIMEOUT_MS, NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -726,9 +772,11 @@ int ofono_get_data_status(int *active) {
     return -2;
   }
 
+  ofono_lock();
   result = g_dbus_proxy_call_sync(proxy, "GetProperties", NULL,
                                   G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS,
                                   NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -759,11 +807,36 @@ int ofono_get_data_status(int *active) {
   return ret;
 }
 
-int ofono_set_data_status(int active) {
+#define USER_DATA_OFF_PATH "/mnt/data/user_data_off"
+
+int ofono_user_data_disabled(void) {
+  return access(USER_DATA_OFF_PATH, F_OK) == 0 ? 1 : 0;
+}
+
+static int user_data_off_persist(int disabled) {
+  if (disabled) {
+    FILE *f = fopen(USER_DATA_OFF_PATH, "w");
+    if (!f)
+      return -1;
+    fputs("1\n", f);
+    fclose(f);
+    return 0;
+  }
+  unlink(USER_DATA_OFF_PATH);
+  return 0;
+}
+
+int ofono_set_data_status_ex(int active, int user_request) {
   GError *error = NULL;
   GVariant *result = NULL;
   GDBusProxy *proxy = NULL;
   char context_path[256] = {0};
+
+  /* 内部激活不得覆盖用户关闭意图 */
+  if (!user_request && active && ofono_user_data_disabled()) {
+    printf("[Data] skip activate — user_data_off set\n");
+    return -4;
+  }
 
   if (!ensure_connection()) {
     return -1;
@@ -784,11 +857,13 @@ int ofono_set_data_status(int active) {
     return -2;
   }
 
+  ofono_lock();
   result = g_dbus_proxy_call_sync(
       proxy, "SetProperty",
       g_variant_new("(sv)", "Active",
                     g_variant_new_boolean(active ? TRUE : FALSE)),
       G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS, NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -799,6 +874,12 @@ int ofono_set_data_status(int active) {
 
   g_variant_unref(result);
   g_object_unref(proxy);
+
+  if (user_request) {
+    if (user_data_off_persist(active ? 0 : 1) != 0) {
+      printf("[Data] warn: failed to persist user_data_off=%d\n", active ? 0 : 1);
+    }
+  }
 
   /* 根据数据连接状态控制监听 */
   if (active) {
@@ -814,6 +895,10 @@ int ofono_set_data_status(int active) {
   }
 
   return 0;
+}
+
+int ofono_set_data_status(int active) {
+  return ofono_set_data_status_ex(active, 0);
 }
 
 int ofono_get_roaming_status(int *roaming_allowed, int *is_roaming) {
@@ -840,9 +925,11 @@ int ofono_get_roaming_status(int *roaming_allowed, int *is_roaming) {
     return -2;
   }
 
+  ofono_lock();
   result = g_dbus_proxy_call_sync(proxy, "GetProperties", NULL,
                                   G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS,
                                   NULL, &error);
+  ofono_unlock();
 
   if (result) {
     GVariant *props = g_variant_get_child_value(result, 0);
@@ -882,9 +969,11 @@ int ofono_get_roaming_status(int *roaming_allowed, int *is_roaming) {
     return ret; /* 返回已获取的 roaming_allowed */
   }
 
+  ofono_lock();
   result = g_dbus_proxy_call_sync(proxy, "GetProperties", NULL,
                                   G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS,
                                   NULL, &error);
+  ofono_unlock();
 
   if (result) {
     GVariant *props = g_variant_get_child_value(result, 0);
@@ -934,11 +1023,13 @@ int ofono_set_roaming_allowed(int allowed) {
     return -2;
   }
 
+  ofono_lock();
   result = g_dbus_proxy_call_sync(
       proxy, "SetProperty",
       g_variant_new("(sv)", "RoamingAllowed",
                     g_variant_new_boolean(allowed ? TRUE : FALSE)),
       G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS, NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -976,9 +1067,11 @@ int ofono_get_all_apn_contexts(ApnContext *contexts, int max_count) {
   }
 
   /* 调用 GetContexts */
+  ofono_lock();
   result =
       g_dbus_proxy_call_sync(proxy, "GetContexts", NULL, G_DBUS_CALL_FLAGS_NONE,
                              OFONO_TIMEOUT_MS, NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -1111,10 +1204,12 @@ int ofono_set_apn_property(const char *context_path, const char *property,
     return -2;
   }
 
+  ofono_lock();
   result = g_dbus_proxy_call_sync(
       proxy, "SetProperty",
       g_variant_new("(sv)", property, g_variant_new_string(value)),
       G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS, NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -1151,9 +1246,11 @@ int ofono_set_apn_properties(const char *context_path, const char *apn,
     return -2;
   }
 
+  ofono_lock();
   result = g_dbus_proxy_call_sync(proxy, "GetProperties", NULL,
                                   G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS,
                                   NULL, &error);
+  ofono_unlock();
 
   if (result) {
     GVariant *props = g_variant_get_child_value(result, 0);
@@ -1180,10 +1277,12 @@ int ofono_set_apn_properties(const char *context_path, const char *apn,
                                   OFONO_SERVICE, context_path,
                                   OFONO_CONNECTION_CONTEXT, NULL, &error);
     if (proxy) {
+      ofono_lock();
       result = g_dbus_proxy_call_sync(
           proxy, "SetProperty",
           g_variant_new("(sv)", "Active", g_variant_new_boolean(FALSE)),
           G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS, NULL, &error);
+      ofono_unlock();
       if (result)
         g_variant_unref(result);
       if (error) {
@@ -1220,10 +1319,12 @@ int ofono_set_apn_properties(const char *context_path, const char *apn,
                                   OFONO_SERVICE, context_path,
                                   OFONO_CONNECTION_CONTEXT, NULL, &error);
     if (proxy) {
+      ofono_lock();
       result = g_dbus_proxy_call_sync(
           proxy, "SetProperty",
           g_variant_new("(sv)", "Active", g_variant_new_boolean(TRUE)),
           G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS, NULL, &error);
+      ofono_unlock();
       if (result)
         g_variant_unref(result);
       if (error)
@@ -1263,9 +1364,11 @@ int ofono_get_serving_cell_tech(char *tech, int size) {
   }
 
   /* 调用 GetServingCellInformation */
+  ofono_lock();
   result = g_dbus_proxy_call_sync(proxy, "GetServingCellInformation", NULL,
                                   G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS,
                                   NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -1336,9 +1439,11 @@ int ofono_get_serving_cell_info(char *tech, int tech_size, int *band) {
   }
 
   /* 调用 GetServingCellInformation */
+  ofono_lock();
   result = g_dbus_proxy_call_sync(proxy, "GetServingCellInformation", NULL,
                                   G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS,
                                   NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -1392,10 +1497,43 @@ int ofono_get_serving_cell_info(char *tech, int tech_size, int *band) {
 
 /* ==================== 数据连接 Watchdog 实现 ==================== */
 
+#define OUTAGE_INTERVAL_S              30
+#define PARTIAL_BOUNCE_STREAK          20
+#define PARTIAL_BOUNCE_RETRY           26
+#define PARTIAL_REBOOT_STREAK          30
+#define TOTAL_REBOOT_STREAK            12
+#define TOTAL_ESCALATE_WINDOW_S       3600
+#define TOTAL_REBOOT_MAX_DAY           2
+#define PARTIAL_GRACE_S              1800
+#define OUTAGE_BOOT_GRACE_S            120
+#define OUTAGE_PARTIAL_ACT_STREAK       3
+#define OUTAGE_TOTAL_LIGHT_EVERY        3
+#define OUTAGE_TOTAL_UDC_EVERY          4
+#define OUTAGE_REBOOT_DAY_FILE     "/mnt/data/outage-watch-reboot-day"
+#define OUTAGE_REBOOT_PENDING_FILE "/mnt/data/outage-watch-reboot-pending"
+#define OUTAGE_PARTIAL_GRACE_FILE  "/mnt/data/outage-watch-partial-grace"
+#define NR_LTE_SWITCH_ON_FILE      "/mnt/data/nr-lte-switch.on"
+#define NR_LTE_BOOT_GRACE_S            300
+#define NR_LTE_TICK_INTERVAL_S          60
+#define NR_LTE_PHASE1_MAX_SWITCHES       3
+
 static pthread_t g_watchdog_thread = 0;
 static volatile int g_watchdog_running = 0;
 static int g_watchdog_interval = 10; /* 默认10秒 */
+static pthread_mutex_t g_watchdog_snap_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char g_last_watchdog_status[256] = {0};
+static time_t g_outage_boot_ts = 0;
+static int g_partial_streak = 0;
+static int g_total_streak = 0;
+static int g_partial_bounce_count = 0;
+static int g_partial_bounce_retry_pending = 0;
+static int g_nr_lte_phase = 1;
+static int g_nr_lte_switch_count = 0;
+static int g_nr_lte_cooldown = 0;
+static int g_nr_lte_cooldown_counter = 0;
+static int g_nr_lte_nr_streak = 0;
+static int g_nr_lte_last_switch = 0;
+static time_t g_nr_lte_last_tick_ts = 0;
 
 /**
  * 获取网络注册状态
@@ -1422,9 +1560,11 @@ int ofono_get_network_status(char *status, int size) {
     return -2;
   }
 
+  ofono_lock();
   result = g_dbus_proxy_call_sync(proxy, "GetProperties", NULL,
                                   G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS,
                                   NULL, &error);
+  ofono_unlock();
 
   if (!result) {
     if (error)
@@ -1463,31 +1603,327 @@ int ofono_get_network_status(char *status, int size) {
 
 /* 壳侧 egress 探测：Active=true 不等于用户面可用（zombie Active）。 */
 #define OFONO_EGRESS_BOUNCE_COOLDOWN_S 90
+#define EGRESS_PROBE_TTL_S 8
+#define EGRESS_PROBE_WAIT_MS 3000
 
 static time_t g_last_egress_bounce_ts = 0;
 
-static int ofono_egress_reachable(void) {
-  /* CN carrier DNS first; AliDNS then 8.8.8.8 as fallback */
-  if (system("ping -c 1 -W 2 211.138.245.180 >/dev/null 2>&1") == 0) {
-    return 1;
+static const char *const OFONO_EGRESS_IPV4_TARGETS[] = {
+    "211.138.245.180",
+    "211.138.240.100",
+    "223.5.5.5",
+    "8.8.8.8",
+};
+
+#define OFONO_CONNECTIVITY_IPV6_TARGET "2400:3200::1"
+
+/* 共享 TTL 快照：禁止与 g_ofono_mutex 嵌套；ping 仅锁外。 */
+static pthread_mutex_t g_egress_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_egress_cache_cond = PTHREAD_COND_INITIALIZER;
+static pthread_t g_egress_probe_tid;
+static int g_egress_probe_running;
+static int g_egress_probe_stop;
+static int g_egress_refreshing;
+static int g_egress_kick;
+static unsigned g_egress_generation;
+static int g_egress_valid; /* 至少完成过一轮刷新 */
+static struct timeval g_egress_updated_at;
+static OfonoConnectivityProbe g_egress_snap;
+
+static void egress_deadline_from_now(struct timespec *ts, int timeout_ms) {
+  struct timeval tv;
+  long usec;
+  gettimeofday(&tv, NULL);
+  if (timeout_ms < 0)
+    timeout_ms = 0;
+  ts->tv_sec = tv.tv_sec + timeout_ms / 1000;
+  usec = tv.tv_usec + (long)(timeout_ms % 1000) * 1000L;
+  if (usec >= 1000000L) {
+    ts->tv_sec += usec / 1000000L;
+    usec %= 1000000L;
   }
-  if (system("ping -c 1 -W 2 211.138.240.100 >/dev/null 2>&1") == 0) {
+  ts->tv_nsec = usec * 1000L;
+}
+
+static int egress_age_ms_locked(void) {
+  struct timeval now;
+  long ms;
+  gettimeofday(&now, NULL);
+  ms = (now.tv_sec - g_egress_updated_at.tv_sec) * 1000L +
+       (now.tv_usec - g_egress_updated_at.tv_usec) / 1000L;
+  if (ms < 0)
+    return 0;
+  if (ms > 2147483647L)
+    return 2147483647;
+  return (int)ms;
+}
+
+static int egress_ttl_expired_locked(void) {
+  if (!g_egress_valid)
     return 1;
+  return egress_age_ms_locked() >= (EGRESS_PROBE_TTL_S * 1000);
+}
+
+static void egress_probe_kick_locked(void) {
+  g_egress_kick = 1;
+  pthread_cond_broadcast(&g_egress_cache_cond);
+}
+
+/* 锁外执行双栈 ping；失败也写出不可达结论。 */
+static void egress_probe_run_unlocked(OfonoConnectivityProbe *out) {
+  size_t i;
+  char cmd[160];
+  struct timeval t0, t1;
+
+  memset(out, 0, sizeof(*out));
+  out->ipv4.success = 0;
+  snprintf(out->ipv4.error, sizeof(out->ipv4.error), "unreachable");
+  for (i = 0; i < sizeof(OFONO_EGRESS_IPV4_TARGETS) /
+                       sizeof(OFONO_EGRESS_IPV4_TARGETS[0]);
+       i++) {
+    snprintf(out->ipv4.target, sizeof(out->ipv4.target), "%s",
+             OFONO_EGRESS_IPV4_TARGETS[i]);
+    snprintf(cmd, sizeof(cmd), "ping -c 1 -W 2 %s >/dev/null 2>&1",
+             OFONO_EGRESS_IPV4_TARGETS[i]);
+    gettimeofday(&t0, NULL);
+    if (system(cmd) == 0) {
+      gettimeofday(&t1, NULL);
+      out->ipv4.success = 1;
+      out->ipv4.error[0] = '\0';
+      out->ipv4.latency_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                             (t1.tv_usec - t0.tv_usec) / 1000.0;
+      break;
+    }
   }
-  if (system("ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1") == 0) {
-    return 1;
+  if (!out->ipv4.success && out->ipv4.target[0] == '\0') {
+    snprintf(out->ipv4.target, sizeof(out->ipv4.target), "%s",
+             OFONO_EGRESS_IPV4_TARGETS[0]);
   }
-  if (system("ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1") == 0) {
-    return 1;
+
+  snprintf(out->ipv6.target, sizeof(out->ipv6.target), "%s",
+           OFONO_CONNECTIVITY_IPV6_TARGET);
+  snprintf(cmd, sizeof(cmd), "ping6 -c 1 -W 2 %s >/dev/null 2>&1",
+           OFONO_CONNECTIVITY_IPV6_TARGET);
+  gettimeofday(&t0, NULL);
+  if (system(cmd) == 0) {
+    gettimeofday(&t1, NULL);
+    out->ipv6.success = 1;
+    out->ipv6.latency_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                           (t1.tv_usec - t0.tv_usec) / 1000.0;
+  } else {
+    out->ipv6.success = 0;
+    snprintf(out->ipv6.error, sizeof(out->ipv6.error), "unreachable");
+  }
+}
+
+static void *egress_probe_worker(void *arg) {
+  (void)arg;
+  for (;;) {
+    OfonoConnectivityProbe local;
+    int remain_ms;
+
+    pthread_mutex_lock(&g_egress_cache_mutex);
+    while (!g_egress_probe_stop && !g_egress_kick) {
+      if (!g_egress_valid) {
+        pthread_cond_wait(&g_egress_cache_cond, &g_egress_cache_mutex);
+        continue;
+      }
+      remain_ms = (EGRESS_PROBE_TTL_S * 1000) - egress_age_ms_locked();
+      if (remain_ms <= 0)
+        break; /* TTL 到期，刷新 */
+      {
+        struct timespec abstime;
+        egress_deadline_from_now(&abstime, remain_ms);
+        pthread_cond_timedwait(&g_egress_cache_cond, &g_egress_cache_mutex,
+                               &abstime);
+      }
+    }
+    if (g_egress_probe_stop) {
+      g_egress_refreshing = 0;
+      pthread_mutex_unlock(&g_egress_cache_mutex);
+      break;
+    }
+    g_egress_kick = 0;
+    g_egress_refreshing = 1;
+    pthread_mutex_unlock(&g_egress_cache_mutex);
+
+    egress_probe_run_unlocked(&local);
+
+    pthread_mutex_lock(&g_egress_cache_mutex);
+    g_egress_snap = local;
+    gettimeofday(&g_egress_updated_at, NULL);
+    g_egress_valid = 1;
+    g_egress_generation++;
+    g_egress_refreshing = 0;
+    pthread_cond_broadcast(&g_egress_cache_cond);
+    pthread_mutex_unlock(&g_egress_cache_mutex);
+  }
+  return NULL;
+}
+
+int ofono_start_egress_probe_cache(void) {
+  pthread_mutex_lock(&g_egress_cache_mutex);
+  if (g_egress_probe_running) {
+    pthread_mutex_unlock(&g_egress_cache_mutex);
+    return 0;
+  }
+  g_egress_probe_stop = 0;
+  g_egress_probe_running = 1;
+  pthread_mutex_unlock(&g_egress_cache_mutex);
+
+  if (pthread_create(&g_egress_probe_tid, NULL, egress_probe_worker, NULL) !=
+      0) {
+    pthread_mutex_lock(&g_egress_cache_mutex);
+    g_egress_probe_running = 0;
+    pthread_mutex_unlock(&g_egress_cache_mutex);
+    return -1;
   }
   return 0;
 }
 
+void ofono_stop_egress_probe_cache(void) {
+  pthread_mutex_lock(&g_egress_cache_mutex);
+  if (!g_egress_probe_running) {
+    pthread_mutex_unlock(&g_egress_cache_mutex);
+    return;
+  }
+  g_egress_probe_stop = 1;
+  pthread_cond_broadcast(&g_egress_cache_cond);
+  pthread_mutex_unlock(&g_egress_cache_mutex);
+
+  pthread_join(g_egress_probe_tid, NULL);
+
+  pthread_mutex_lock(&g_egress_cache_mutex);
+  g_egress_probe_running = 0;
+  pthread_mutex_unlock(&g_egress_cache_mutex);
+}
+
+static int ofono_egress_reachable(void) {
+  OfonoConnectivityProbe snap;
+  int valid;
+
+  pthread_mutex_lock(&g_egress_cache_mutex);
+  valid = g_egress_valid;
+  if (valid)
+    snap = g_egress_snap;
+  if (!valid || egress_ttl_expired_locked())
+    egress_probe_kick_locked();
+  pthread_mutex_unlock(&g_egress_cache_mutex);
+
+  if (!valid)
+    return 0;
+  return snap.ipv4.success ? 1 : 0;
+}
+
+int ofono_probe_connectivity_ex(OfonoConnectivityProbe *out, int *age_ms,
+                                int *stale) {
+  int age = -1;
+  int is_stale = 1;
+
+  if (!out)
+    return -1;
+
+  pthread_mutex_lock(&g_egress_cache_mutex);
+  if (g_egress_valid) {
+    *out = g_egress_snap;
+    age = egress_age_ms_locked();
+    is_stale = egress_ttl_expired_locked() ? 1 : 0;
+    if (is_stale)
+      egress_probe_kick_locked();
+  } else {
+    memset(out, 0, sizeof(*out));
+    snprintf(out->ipv4.target, sizeof(out->ipv4.target), "%s",
+             OFONO_EGRESS_IPV4_TARGETS[0]);
+    snprintf(out->ipv6.target, sizeof(out->ipv6.target), "%s",
+             OFONO_CONNECTIVITY_IPV6_TARGET);
+    snprintf(out->ipv4.error, sizeof(out->ipv4.error), "cache miss");
+    snprintf(out->ipv6.error, sizeof(out->ipv6.error), "cache miss");
+    egress_probe_kick_locked();
+  }
+  pthread_mutex_unlock(&g_egress_cache_mutex);
+
+  if (age_ms)
+    *age_ms = age;
+  if (stale)
+    *stale = is_stale;
+  return 0;
+}
+
+int ofono_probe_connectivity(OfonoConnectivityProbe *out) {
+  return ofono_probe_connectivity_ex(out, NULL, NULL);
+}
+
+void ofono_get_egress_cache_meta(int *age_ms, int *stale) {
+  int age = -1;
+  int is_stale = 1;
+
+  pthread_mutex_lock(&g_egress_cache_mutex);
+  if (g_egress_valid) {
+    age = egress_age_ms_locked();
+    is_stale = egress_ttl_expired_locked() ? 1 : 0;
+  }
+  pthread_mutex_unlock(&g_egress_cache_mutex);
+
+  if (age_ms)
+    *age_ms = age;
+  if (stale)
+    *stale = is_stale;
+}
+
+int ofono_egress_reachable_fresh(int timeout_ms) {
+  unsigned wait_for;
+  OfonoConnectivityProbe snap;
+  int got = 0;
+  struct timespec deadline;
+
+  pthread_mutex_lock(&g_egress_cache_mutex);
+  g_egress_valid = 0;
+  /* post-invalidate: if refresh in-flight, wait one extra generation so we
+   * do not accept a ping round that started before invalidate (e.g. during
+   * bounce PDP-down sleeps). Kick still schedules a post-invalidate round. */
+  wait_for = g_egress_generation + 1 + (g_egress_refreshing ? 1 : 0);
+  egress_probe_kick_locked();
+  egress_deadline_from_now(&deadline, timeout_ms);
+
+  while (g_egress_generation < wait_for) {
+    int rc = pthread_cond_timedwait(&g_egress_cache_cond, &g_egress_cache_mutex,
+                                    &deadline);
+    if (rc == ETIMEDOUT)
+      break;
+  }
+  if (g_egress_generation >= wait_for && g_egress_valid) {
+    snap = g_egress_snap;
+    got = 1;
+  }
+  pthread_mutex_unlock(&g_egress_cache_mutex);
+
+  if (!got)
+    return 0;
+  return snap.ipv4.success ? 1 : 0;
+}
+
+int ofono_bounce_pdp_context(void) {
+  if (ofono_user_data_disabled()) {
+    printf("[DataRestore] bounce skipped — user_data_off\n");
+    return -1;
+  }
+  (void)ofono_set_data_status_ex(0, 0);
+  /* ofono lock released during bounce wait */
+  sleep(4);
+  if (ofono_set_data_status_ex(1, 0) != 0) {
+    return -1;
+  }
+  int active = 0;
+  if (ofono_get_data_status(&active) == 0 && active) {
+    return 0;
+  }
+  return -1;
+}
+
 /**
- * 强制 PDP 翻转（等同补丁 bounce-pdp）。
- * 使用 ofono_set_data_status：关闭后再开启会重新拉起 DataMonitor。
+ * 强制 PDP 翻转（watchdog 用，含冷却与 egress 校验）。
  */
-static int ofono_bounce_pdp(void) {
+int ofono_bounce_pdp(void) {
   time_t now = time(NULL);
   if (g_last_egress_bounce_ts != 0 &&
       (now - g_last_egress_bounce_ts) < OFONO_EGRESS_BOUNCE_COOLDOWN_S) {
@@ -1496,13 +1932,11 @@ static int ofono_bounce_pdp(void) {
   g_last_egress_bounce_ts = now;
 
   printf("[DataRestore] egress dead while Active — bouncing PDP\n");
-  (void)ofono_set_data_status(0);
-  sleep(3);
-  if (ofono_set_data_status(1) != 0) {
+  if (ofono_bounce_pdp_context() != 0) {
     return -1;
   }
   sleep(2);
-  return ofono_egress_reachable() ? 0 : -1;
+  return ofono_egress_reachable_fresh(EGRESS_PROBE_WAIT_MS) ? 0 : -1;
 }
 
 /**
@@ -1516,6 +1950,12 @@ int ofono_check_and_restore_data(char *result, int size) {
 
   if (!result || size <= 0) {
     return -1;
+  }
+
+  /* 0. 用户显式关闭移动数据：跳过自动恢复（user_data_off skip restore） */
+  if (ofono_user_data_disabled()) {
+    snprintf(result, size, "用户已关闭移动数据，跳过自动恢复");
+    return 0;
   }
 
   /* 1. 检查网络注册状态 */
@@ -1553,9 +1993,11 @@ int ofono_check_and_restore_data(char *result, int size) {
     return -1;
   }
 
+  ofono_lock();
   ctx_result = g_dbus_proxy_call_sync(proxy, "GetProperties", NULL,
                                       G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS,
                                       NULL, &error);
+  ofono_unlock();
 
   if (!ctx_result) {
     if (error)
@@ -1593,25 +2035,14 @@ int ofono_check_and_restore_data(char *result, int size) {
     return 0;
   }
 
-  /* 5. Active=true：必须 egress 可达，否则视为 zombie Active 并 bounce */
+  /* 5. Active=true：egress 由 watchdog streak 触发 bounce，此处不立即 bounce */
   if (active) {
     if (ofono_egress_reachable()) {
       snprintf(result, size, "已连接 (APN: %s)", apn);
       return 0;
     }
-    {
-      int br = ofono_bounce_pdp();
-      if (br == 0) {
-        snprintf(result, size, "egress 恢复 (bounce PDP, APN: %s)", apn);
-        return 0;
-      }
-      if (br == -2) {
-        snprintf(result, size, "egress 异常，bounce 冷却中 (APN: %s)", apn);
-        return -1;
-      }
-      snprintf(result, size, "egress 异常，bounce 失败 (APN: %s)", apn);
-      return -1;
-    }
+    snprintf(result, size, "egress dead (APN: %s), wait streak bounce", apn);
+    return 0;
   }
 
   /* 6. Active=false：尝试激活数据连接 */
@@ -1624,6 +2055,528 @@ int ofono_check_and_restore_data(char *result, int size) {
   }
 }
 
+static int outage_has_gateway(void) {
+  return system("ifconfig usb0 2>/dev/null | grep -q 'inet addr:192.168.66.1'") ==
+         0;
+}
+
+static int outage_dhcp_ok(void) {
+  return system("netstat -uln 2>/dev/null | grep -q ':67'") == 0;
+}
+
+static int outage_cell_active(void) {
+  int active = 0;
+  return ofono_get_data_status(&active) == 0 && active;
+}
+
+static int nr_lte_uptime_sec(void) {
+  FILE *f = fopen("/proc/uptime", "r");
+  if (!f)
+    return -1;
+  double up = 0;
+  if (fscanf(f, "%lf", &up) != 1) {
+    fclose(f);
+    return -1;
+  }
+  fclose(f);
+  return (int)up;
+}
+
+static int nr_lte_get_registration_technology(char *tech, size_t size) {
+  GError *error = NULL;
+  GVariant *result = NULL;
+  GDBusProxy *proxy = NULL;
+  int ret = -1;
+
+  if (!tech || size == 0 || !ensure_connection())
+    return -1;
+
+  tech[0] = '\0';
+
+  proxy = g_dbus_proxy_new_sync(g_dbus_conn, G_DBUS_PROXY_FLAGS_NONE, NULL,
+                                OFONO_SERVICE, get_current_modem_path(),
+                                OFONO_NETWORK_REGISTRATION, NULL, &error);
+  if (!proxy) {
+    if (error)
+      g_error_free(error);
+    return -2;
+  }
+
+  ofono_lock();
+  result = g_dbus_proxy_call_sync(proxy, "GetProperties", NULL,
+                                  G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS,
+                                  NULL, &error);
+  ofono_unlock();
+  if (!result) {
+    if (error)
+      g_error_free(error);
+    g_object_unref(proxy);
+    return -3;
+  }
+
+  GVariant *props = g_variant_get_child_value(result, 0);
+  if (props) {
+    GVariant *v =
+        g_variant_lookup_value(props, "Technology", G_VARIANT_TYPE_STRING);
+    if (v) {
+      const gchar *tech_str = g_variant_get_string(v, NULL);
+      if (tech_str) {
+        strncpy(tech, tech_str, size - 1);
+        tech[size - 1] = '\0';
+        ret = 0;
+      }
+      g_variant_unref(v);
+    }
+    g_variant_unref(props);
+  }
+
+  g_variant_unref(result);
+  g_object_unref(proxy);
+  return ret;
+}
+
+static void nr_lte_apply_nr_preference(void) {
+  const char *modem = get_current_modem_path();
+  printf("[NrLteSwitch] TechnologyPreference: NR 5G only -> NR 5G/LTE auto\n");
+  (void)ofono_network_set_mode_sync(modem, 8, OFONO_TIMEOUT_MS);
+  (void)ofono_network_set_mode_sync(modem, 9, OFONO_TIMEOUT_MS);
+}
+
+static void nr_lte_reset_phase1(void) {
+  g_nr_lte_phase = 1;
+  g_nr_lte_switch_count = 0;
+  g_nr_lte_cooldown = 0;
+  g_nr_lte_cooldown_counter = 0;
+  g_nr_lte_nr_streak = 0;
+  g_nr_lte_last_switch = 0;
+}
+
+static void nr_lte_switch_tick(void) {
+  if (access(NR_LTE_SWITCH_ON_FILE, F_OK) != 0)
+    return;
+
+  int up = nr_lte_uptime_sec();
+  if (up >= 0 && up < NR_LTE_BOOT_GRACE_S)
+    return;
+
+  char tech[32];
+  if (nr_lte_get_registration_technology(tech, sizeof(tech)) != 0 ||
+      tech[0] == '\0')
+    return;
+
+  if (strcmp(tech, "NR") == 0) {
+    g_nr_lte_nr_streak++;
+    if (g_nr_lte_nr_streak >= 2) {
+      printf("[NrLteSwitch] consecutive NR -> reset phase 1\n");
+      nr_lte_reset_phase1();
+    }
+    return;
+  }
+
+  if (strcmp(tech, "LTE") != 0)
+    return;
+
+  g_nr_lte_nr_streak = 0;
+
+  if (outage_cell_active())
+    return;
+
+  if (g_nr_lte_phase == 1) {
+    if (g_nr_lte_switch_count < NR_LTE_PHASE1_MAX_SWITCHES) {
+      nr_lte_apply_nr_preference();
+      g_nr_lte_switch_count++;
+      printf("[NrLteSwitch] phase1 switch %d/%d\n", g_nr_lte_switch_count,
+             NR_LTE_PHASE1_MAX_SWITCHES);
+    } else {
+      g_nr_lte_phase = 2;
+      g_nr_lte_cooldown = 10;
+      g_nr_lte_cooldown_counter = g_nr_lte_cooldown;
+      g_nr_lte_last_switch = 0;
+      printf("[NrLteSwitch] phase1 exhausted -> phase2 cooldown=%d min\n",
+             g_nr_lte_cooldown);
+    }
+  } else if (g_nr_lte_cooldown_counter > 0) {
+    g_nr_lte_cooldown_counter--;
+    if (g_nr_lte_cooldown_counter == 0)
+      g_nr_lte_last_switch = 0;
+  } else if (g_nr_lte_last_switch == 0) {
+    nr_lte_apply_nr_preference();
+    g_nr_lte_last_switch = 1;
+  } else {
+    if (g_nr_lte_cooldown == 10)
+      g_nr_lte_cooldown = 30;
+    else
+      g_nr_lte_cooldown = 60;
+    g_nr_lte_cooldown_counter = g_nr_lte_cooldown;
+    g_nr_lte_last_switch = 0;
+    printf("[NrLteSwitch] phase2 cooldown escalate -> %d min\n",
+           g_nr_lte_cooldown);
+  }
+}
+
+static int outage_usb0_has_inet(void) {
+  return system("ifconfig usb0 2>/dev/null | grep -q 'inet addr:'") == 0;
+}
+
+static int outage_total_due(int streak, int first, int every) {
+  if (streak < first || every <= 0)
+    return 0;
+  return ((streak - first) % every) == 0;
+}
+
+static int outage_reboot_count_for_day(const char *want_day) {
+  FILE *f = fopen(OUTAGE_REBOOT_DAY_FILE, "r");
+  if (!f)
+    return 0;
+  char stored_day[16] = {0};
+  int stored_cnt = 0;
+  if (fscanf(f, "%15s %d", stored_day, &stored_cnt) == 2 &&
+      strcmp(stored_day, want_day) == 0) {
+    fclose(f);
+    return stored_cnt;
+  }
+  fclose(f);
+  return 0;
+}
+
+static void outage_today_str(char *buf, size_t size) {
+  time_t now = time(NULL);
+  struct tm tm;
+  if (now == (time_t)-1 || !localtime_r(&now, &tm)) {
+    strncpy(buf, "unknown", size - 1);
+    buf[size - 1] = '\0';
+    return;
+  }
+  strftime(buf, size, "%Y-%m-%d", &tm);
+}
+
+static int outage_is_iso_day(const char *day) {
+  return day && strlen(day) == 10 && day[4] == '-' && day[7] == '-';
+}
+
+static void outage_budget_accounting_day(char *chosen, size_t size) {
+  char clock_day[16];
+  char anchor[16] = {0};
+  outage_today_str(clock_day, sizeof(clock_day));
+
+  FILE *pf = fopen(OUTAGE_REBOOT_PENDING_FILE, "r");
+  if (pf) {
+    char pending_day[16] = {0};
+    if (fscanf(pf, "%15s", pending_day) == 1 && outage_is_iso_day(pending_day))
+      strncpy(anchor, pending_day, sizeof(anchor) - 1);
+    fclose(pf);
+  }
+  if (anchor[0] == '\0') {
+    FILE *df = fopen(OUTAGE_REBOOT_DAY_FILE, "r");
+    if (df) {
+      char stored_day[16] = {0};
+      int cnt = 0;
+      if (fscanf(df, "%15s %d", stored_day, &cnt) == 2 &&
+          outage_is_iso_day(stored_day))
+        strncpy(anchor, stored_day, sizeof(anchor) - 1);
+      fclose(df);
+    }
+  }
+
+  strncpy(chosen, clock_day, size - 1);
+  chosen[size - 1] = '\0';
+  if (anchor[0] != '\0' && strcmp(clock_day, "unknown") != 0 &&
+      strcmp(clock_day, anchor) != 0 && strcmp(clock_day, anchor) < 0)
+    strncpy(chosen, anchor, size - 1);
+}
+
+static int outage_total_reboot_count_today(void) {
+  char day[16];
+  outage_budget_accounting_day(day, sizeof(day));
+  return outage_reboot_count_for_day(day);
+}
+
+static int outage_total_reboot_effective_count(void) {
+  int count = outage_total_reboot_count_today();
+  if (access(OUTAGE_REBOOT_PENDING_FILE, F_OK) == 0)
+    count++;
+  return count;
+}
+
+static int outage_total_reboot_budget_exhausted(void) {
+  return outage_total_reboot_effective_count() >= TOTAL_REBOOT_MAX_DAY;
+}
+
+static int outage_commit_pending_reboot_budget(void) {
+  FILE *pf = fopen(OUTAGE_REBOOT_PENDING_FILE, "r");
+  if (!pf)
+    return 0;
+  char pending_day[16] = {0};
+  char rest[128] = {0};
+  if (fscanf(pf, "%15s %127[^\n]", pending_day, rest) < 1) {
+    fclose(pf);
+    return -1;
+  }
+  fclose(pf);
+
+  char clock_day[16];
+  outage_today_str(clock_day, sizeof(clock_day));
+  const char *day =
+      outage_is_iso_day(pending_day) ? pending_day : clock_day;
+  int count = outage_reboot_count_for_day(day) + 1;
+
+  for (int i = 0; i < 15; i++) {
+    FILE *wf = fopen(OUTAGE_REBOOT_DAY_FILE, "w");
+    if (!wf) {
+      sleep(1);
+      continue;
+    }
+    fprintf(wf, "%s %d\n", day, count);
+    fclose(wf);
+
+    FILE *rf = fopen(OUTAGE_REBOOT_DAY_FILE, "r");
+    if (!rf) {
+      sleep(1);
+      continue;
+    }
+    char got_day[16] = {0};
+    int got_cnt = 0;
+    int ok = fscanf(rf, "%15s %d", got_day, &got_cnt) == 2 &&
+             strcmp(got_day, day) == 0 && got_cnt == count;
+    fclose(rf);
+    if (ok) {
+      unlink(OUTAGE_REBOOT_PENDING_FILE);
+      printf("[Watchdog] TOTAL: commit escalate reboot budget (%d/%d day=%s)\n",
+             count, TOTAL_REBOOT_MAX_DAY, day);
+      return 0;
+    }
+    sleep(1);
+  }
+  printf("[Watchdog] TOTAL: commit escalate reboot budget FAILED day=%s count=%d\n",
+         day, count);
+  return -1;
+}
+
+static int outage_in_escalate_window(void) {
+  time_t now = time(NULL);
+  if (now == (time_t)-1 || g_outage_boot_ts == 0)
+    return 0;
+  return now < g_outage_boot_ts + TOTAL_ESCALATE_WINDOW_S;
+}
+
+static int outage_partial_grace_active(void) {
+  FILE *f = fopen(OUTAGE_PARTIAL_GRACE_FILE, "r");
+  if (!f)
+    return 0;
+  long gs = 0;
+  if (fscanf(f, "%ld", &gs) != 1) {
+    fclose(f);
+    return 0;
+  }
+  fclose(f);
+  time_t now = time(NULL);
+  if (now == (time_t)-1)
+    return 0;
+  return now < (time_t)(gs + PARTIAL_GRACE_S);
+}
+
+static void outage_partial_grace_clear_if_usb_ok(void) {
+  if (access(OUTAGE_PARTIAL_GRACE_FILE, F_OK) != 0)
+    return;
+  if (outage_usb0_has_inet()) {
+    unlink(OUTAGE_PARTIAL_GRACE_FILE);
+    printf("[Watchdog] PARTIAL grace cleared - usb0 inet ready\n");
+  }
+}
+
+static int outage_write_pending(const char *day, const char *kind, int streak) {
+  FILE *f = fopen(OUTAGE_REBOOT_PENDING_FILE, "w");
+  if (!f)
+    return -1;
+  fprintf(f, "%s pending %s streak=%d\n", day, kind, streak);
+  fclose(f);
+  return 0;
+}
+
+static void outage_write_partial_grace(void) {
+  time_t now = time(NULL);
+  if (now == (time_t)-1)
+    return;
+  FILE *f = fopen(OUTAGE_PARTIAL_GRACE_FILE, "w");
+  if (!f)
+    return;
+  fprintf(f, "%ld\n", (long)now);
+  fclose(f);
+}
+
+static void outage_try_total_escalate_reboot(void) {
+  if (access("/mnt/data/need-usb-renum", F_OK) == 0) {
+    printf("[Watchdog] TOTAL: escalate deferred - waiting USB renum (streak=%d)\n",
+           g_total_streak);
+    return;
+  }
+  if (outage_partial_grace_active()) {
+    printf("[Watchdog] TOTAL: escalate deferred - PARTIAL grace active (streak=%d)\n",
+           g_total_streak);
+    return;
+  }
+  if (!outage_usb0_has_inet() && outage_total_reboot_count_today() >= 1) {
+    printf("[Watchdog] TOTAL: escalate deferred - usb0 no inet after spend (streak=%d)\n",
+           g_total_streak);
+    return;
+  }
+  if (!outage_in_escalate_window()) {
+    printf("[Watchdog] TOTAL: escalate skipped - outside window %ds (streak=%d)\n",
+           TOTAL_ESCALATE_WINDOW_S, g_total_streak);
+    return;
+  }
+  if (access(OUTAGE_REBOOT_PENDING_FILE, F_OK) == 0) {
+    printf("[Watchdog] TOTAL: escalate skipped - pending exists (streak=%d)\n",
+           g_total_streak);
+    return;
+  }
+  char day[16];
+  outage_budget_accounting_day(day, sizeof(day));
+  int count = outage_total_reboot_count_today();
+  if (count >= TOTAL_REBOOT_MAX_DAY) {
+    printf("[Watchdog] TOTAL: reboot budget exhausted (%d/%d day=%s)\n", count,
+           TOTAL_REBOOT_MAX_DAY, day);
+    return;
+  }
+  if (outage_write_pending(day, "streak", g_total_streak) != 0)
+    return;
+  printf("[Watchdog] TOTAL: escalate soft reboot need-usb-renum (streak=%d pending->%d/%d)\n",
+         g_total_streak, count + 1, TOTAL_REBOOT_MAX_DAY);
+  sync();
+  sleep(2);
+  device_reboot();
+}
+
+static void outage_try_partial_escalate_reboot(void) {
+  if (access(OUTAGE_REBOOT_PENDING_FILE, F_OK) == 0) {
+    printf("[Watchdog] PARTIAL: escalate skipped - pending exists (streak=%d)\n",
+           g_partial_streak);
+    return;
+  }
+  char day[16];
+  outage_budget_accounting_day(day, sizeof(day));
+  int count = outage_total_reboot_count_today();
+  if (count >= TOTAL_REBOOT_MAX_DAY) {
+    printf("[Watchdog] PARTIAL: reboot budget exhausted (%d/%d day=%s streak=%d)\n",
+           count, TOTAL_REBOOT_MAX_DAY, day, g_partial_streak);
+    return;
+  }
+  if (outage_write_pending(day, "partial", g_partial_streak) != 0)
+    return;
+  printf("[Watchdog] PARTIAL: escalate soft reboot need-usb-renum (streak=%d pending->%d/%d)\n",
+         g_partial_streak, count + 1, TOTAL_REBOOT_MAX_DAY);
+  outage_write_partial_grace();
+  sync();
+  sleep(2);
+  device_reboot();
+}
+
+static void outage_watchdog_tick(void) {
+  int gw = outage_has_gateway();
+  int dhcp = outage_dhcp_ok();
+  int net = ofono_egress_reachable();
+  int cell = outage_cell_active();
+  time_t now = time(NULL);
+  int in_grace =
+      g_outage_boot_ts != 0 && now != (time_t)-1 &&
+      now < g_outage_boot_ts + OUTAGE_BOOT_GRACE_S;
+  int total_streak;
+  int partial_streak;
+  int had_streak;
+
+  if (gw)
+    outage_partial_grace_clear_if_usb_ok();
+
+  if (!gw || !dhcp) {
+    /* 短临界区：仅改 snap 字段；禁止持锁 system()/reboot */
+    pthread_mutex_lock(&g_watchdog_snap_mutex);
+    g_total_streak++;
+    g_partial_streak = 0;
+    total_streak = g_total_streak;
+    pthread_mutex_unlock(&g_watchdog_snap_mutex);
+    printf("[Watchdog] TOTAL gw=%d dhcp=%d streak=%d grace=%d\n", gw, dhcp,
+           total_streak, in_grace);
+
+    if (in_grace) {
+      system("touch /tmp/usb-tether-refresh 2>/dev/null");
+    } else if (outage_total_reboot_budget_exhausted()) {
+      if (total_streak == TOTAL_REBOOT_STREAK ||
+          (total_streak % TOTAL_REBOOT_STREAK) == 0) {
+        printf("[Watchdog] TOTAL: budget exhausted - skip repair (streak=%d)\n",
+               total_streak);
+      }
+    } else {
+      if (outage_total_due(total_streak, 2, OUTAGE_TOTAL_LIGHT_EVERY)) {
+        system("touch /tmp/usb-tether-refresh 2>/dev/null");
+        system("touch /tmp/usb-tether-force-repair 2>/dev/null");
+        printf("[Watchdog] TOTAL: light repair (streak=%d)\n", total_streak);
+      }
+      if (outage_total_due(total_streak, 6, OUTAGE_TOTAL_UDC_EVERY)) {
+        printf("[Watchdog] TOTAL: udc/fix-rndis (streak=%d)\n", total_streak);
+        system("touch /tmp/usb-tether-force-repair 2>/dev/null");
+        (void)usb_mode_ensure_rndis_link();
+      }
+      if (total_streak == TOTAL_REBOOT_STREAK ||
+          total_streak == TOTAL_REBOOT_STREAK * 2) {
+        outage_try_total_escalate_reboot();
+      }
+    }
+  } else if (!net) {
+    pthread_mutex_lock(&g_watchdog_snap_mutex);
+    g_partial_streak++;
+    g_total_streak = 0;
+    partial_streak = g_partial_streak;
+    pthread_mutex_unlock(&g_watchdog_snap_mutex);
+
+    if (partial_streak < OUTAGE_PARTIAL_ACT_STREAK) {
+      printf("[Watchdog] PARTIAL_BLIP gw=1 net=0 cell=%d streak=%d\n", cell,
+             partial_streak);
+    } else {
+      printf("[Watchdog] PARTIAL gw=1 net=0 cell=%d streak=%d\n", cell,
+             partial_streak);
+
+      if (partial_streak == OUTAGE_PARTIAL_ACT_STREAK)
+        system("touch /tmp/usb-tether-refresh 2>/dev/null");
+
+      if (partial_streak == PARTIAL_BOUNCE_STREAK ||
+          partial_streak == PARTIAL_BOUNCE_RETRY) {
+        int br = ofono_bounce_pdp();
+        if (br == -2)
+          g_partial_bounce_retry_pending = 1;
+        else if (br == 0)
+          g_partial_bounce_count++;
+      } else if (g_partial_bounce_retry_pending &&
+                 partial_streak == PARTIAL_BOUNCE_RETRY) {
+        int br = ofono_bounce_pdp();
+        if (br != -2) {
+          g_partial_bounce_count++;
+          g_partial_bounce_retry_pending = 0;
+        }
+      }
+
+      if (partial_streak == PARTIAL_REBOOT_STREAK) {
+        if (outage_total_reboot_budget_exhausted()) {
+          printf("[Watchdog] PARTIAL: budget exhausted - skip reboot (streak=%d)\n",
+                 partial_streak);
+        } else {
+          outage_try_partial_escalate_reboot();
+        }
+      }
+    }
+  } else {
+    pthread_mutex_lock(&g_watchdog_snap_mutex);
+    had_streak = (g_total_streak > 0 || g_partial_streak > 0);
+    g_total_streak = 0;
+    g_partial_streak = 0;
+    pthread_mutex_unlock(&g_watchdog_snap_mutex);
+    if (had_streak) {
+      printf("[Watchdog] RECOVERED gw=%d dhcp=%d net=%d\n", gw, dhcp, net);
+    }
+    g_partial_bounce_count = 0;
+    g_partial_bounce_retry_pending = 0;
+  }
+}
+
 /**
  * Watchdog 线程函数
  */
@@ -1631,21 +2584,50 @@ static void *data_watchdog_thread(void *arg) {
   (void)arg;
   char status[256];
 
-  printf("[Watchdog] 数据连接监控线程已启动 (间隔: %d秒)\n",
-         g_watchdog_interval);
+  g_outage_boot_ts = time(NULL);
+  pthread_mutex_lock(&g_watchdog_snap_mutex);
+  g_partial_streak = 0;
+  g_total_streak = 0;
+  pthread_mutex_unlock(&g_watchdog_snap_mutex);
+  g_partial_bounce_count = 0;
+  g_partial_bounce_retry_pending = 0;
+  nr_lte_reset_phase1();
+  g_nr_lte_last_tick_ts = 0;
+  outage_commit_pending_reboot_budget();
+
+  printf("[Watchdog] 数据连接监控线程已启动 (间隔: %d秒, PARTIAL bounce@%d/%d reboot@%d, TOTAL reboot@%d)\n",
+         g_watchdog_interval, PARTIAL_BOUNCE_STREAK, PARTIAL_BOUNCE_RETRY,
+         PARTIAL_REBOOT_STREAK, TOTAL_REBOOT_STREAK);
 
   while (g_watchdog_running) {
-    /* 检查并恢复数据连接 */
-    if (ofono_check_and_restore_data(status, sizeof(status)) >= 0) {
-      /* 只在状态变化时打印日志 */
-      if (strcmp(status, g_last_watchdog_status) != 0) {
-        printf("[Watchdog] %s\n", status);
-        strncpy(g_last_watchdog_status, status,
-                sizeof(g_last_watchdog_status) - 1);
+    outage_watchdog_tick();
+
+    {
+      time_t nr_now = time(NULL);
+      if (nr_now != (time_t)-1) {
+        if (g_nr_lte_last_tick_ts == 0)
+          g_nr_lte_last_tick_ts = nr_now;
+        else if (nr_now >= g_nr_lte_last_tick_ts + NR_LTE_TICK_INTERVAL_S) {
+          g_nr_lte_last_tick_ts = nr_now;
+          nr_lte_switch_tick();
+        }
       }
     }
 
-    /* 等待下一次检查 */
+    if (ofono_check_and_restore_data(status, sizeof(status)) >= 0) {
+      int status_changed = 0;
+      pthread_mutex_lock(&g_watchdog_snap_mutex);
+      if (strcmp(status, g_last_watchdog_status) != 0) {
+        strncpy(g_last_watchdog_status, status,
+                sizeof(g_last_watchdog_status) - 1);
+        g_last_watchdog_status[sizeof(g_last_watchdog_status) - 1] = '\0';
+        status_changed = 1;
+      }
+      pthread_mutex_unlock(&g_watchdog_snap_mutex);
+      if (status_changed)
+        printf("[Watchdog] %s\n", status);
+    }
+
     for (int i = 0; i < g_watchdog_interval && g_watchdog_running; i++) {
       sleep(1);
     }
@@ -1665,12 +2647,16 @@ int ofono_start_data_watchdog(int interval_secs) {
   }
 
   g_watchdog_interval = (interval_secs > 0) ? interval_secs : 10;
+  pthread_mutex_lock(&g_watchdog_snap_mutex);
   g_watchdog_running = 1;
   g_last_watchdog_status[0] = '\0';
+  pthread_mutex_unlock(&g_watchdog_snap_mutex);
 
   if (pthread_create(&g_watchdog_thread, NULL, data_watchdog_thread, NULL) !=
       0) {
+    pthread_mutex_lock(&g_watchdog_snap_mutex);
     g_watchdog_running = 0;
+    pthread_mutex_unlock(&g_watchdog_snap_mutex);
     printf("[Watchdog] 创建线程失败\n");
     return -1;
   }
@@ -1687,7 +2673,9 @@ void ofono_stop_data_watchdog(void) {
     return;
   }
 
+  pthread_mutex_lock(&g_watchdog_snap_mutex);
   g_watchdog_running = 0;
+  pthread_mutex_unlock(&g_watchdog_snap_mutex);
   /* 线程会在下一次循环时自动退出 */
 }
 
@@ -1695,6 +2683,31 @@ void ofono_stop_data_watchdog(void) {
  * 检查 Watchdog 是否运行中
  */
 int ofono_is_watchdog_running(void) { return g_watchdog_running ? 1 : 0; }
+
+/**
+ * 获取 Watchdog 可观测性快照（不改变 heal/escalate 行为）
+ */
+int ofono_get_watchdog_snapshot(OfonoWatchdogSnapshot *out) {
+  if (!out)
+    return -1;
+
+  memset(out, 0, sizeof(*out));
+
+  /* 短临界区：仅拷贝内存态；禁止持锁 fopen */
+  pthread_mutex_lock(&g_watchdog_snap_mutex);
+  out->running = g_watchdog_running ? 1 : 0;
+  out->partial_streak = g_partial_streak;
+  out->total_streak = g_total_streak;
+  strncpy(out->status, g_last_watchdog_status, sizeof(out->status) - 1);
+  pthread_mutex_unlock(&g_watchdog_snap_mutex);
+
+  out->reboot_max = TOTAL_REBOOT_MAX_DAY;
+  out->reboot_used = outage_total_reboot_effective_count();
+  out->pending = (access(OUTAGE_REBOOT_PENDING_FILE, F_OK) == 0) ? 1 : 0;
+  outage_budget_accounting_day(out->accounting_day, sizeof(out->accounting_day));
+
+  return 0;
+}
 
 /* ==================== 数据连接监听实现 (DBus 信号驱动) ==================== */
 

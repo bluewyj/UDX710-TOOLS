@@ -20,6 +20,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
 
 /* GET /api/info - 获取系统信息 */
 void handle_info(struct mg_connection *c, struct mg_http_message *hm) {
@@ -976,22 +978,46 @@ void handle_get_system_time(struct mg_connection *c,
   HTTP_OK_FREE(c, json_finish(j));
 }
 
-/* POST /api/set/time - NTP同步系统时间 */
+/* POST /api/set/time - NTP同步系统时间
+ * 设备镜像无 ntpdate，仅有 ISC ntpd；用 ntpd -gq 一次性校正。
+ */
+static int ntp_sync_with_server(char *output, size_t size, const char *server) {
+  char cmd[384];
+
+  if (access("/usr/sbin/ntpdate", X_OK) == 0 ||
+      access("/usr/bin/ntpdate", X_OK) == 0) {
+    if (run_command(output, size, "ntpdate", "-u", server, NULL) == 0)
+      return 0;
+  }
+
+  /* 停掉常驻 ntpd 后 one-shot，再拉起 init 脚本 */
+  snprintf(cmd, sizeof(cmd),
+           "killall ntpd 2>/dev/null; "
+           "/usr/sbin/ntpd -gq -x -4 %s; "
+           "r=$?; "
+           "if [ -x /etc/init.d/ntpd ]; then /etc/init.d/ntpd start >/dev/null "
+           "2>&1; "
+           "else /usr/sbin/ntpd -u ntp:ntp -p /var/run/ntpd.pid -g "
+           ">/dev/null 2>&1; fi; "
+           "exit $r",
+           server);
+  return run_command(output, size, "sh", "-c", cmd, NULL);
+}
+
 void handle_set_system_time(struct mg_connection *c,
                             struct mg_http_message *hm) {
   HTTP_CHECK_POST(c, hm);
 
-  char output[512];
-
-  const char *ntp_servers[] = {"ntp.aliyun.com", "pool.ntp.org",
-                               "time.windows.com", NULL};
-
+  char output[1024];
+  const char *ntp_servers[] = {"ntp.aliyun.com", "ntp.tencent.com",
+                               "pool.ntp.org", NULL};
   int success = 0;
   const char *used_server = NULL;
+  int i;
 
-  for (int i = 0; ntp_servers[i] != NULL; i++) {
-    if (run_command(output, sizeof(output), "ntpdate", ntp_servers[i], NULL) ==
-        0) {
+  for (i = 0; ntp_servers[i] != NULL; i++) {
+    memset(output, 0, sizeof(output));
+    if (ntp_sync_with_server(output, sizeof(output), ntp_servers[i]) == 0) {
       success = 1;
       used_server = ntp_servers[i];
       break;
@@ -1028,6 +1054,7 @@ void handle_data_status(struct mg_connection *c, struct mg_http_message *hm) {
       json_add_str(j, "message", "Success");
       json_key_obj_open(j, "data");
       json_add_bool(j, "active", active);
+      json_add_bool(j, "user_disabled", ofono_user_data_disabled());
       json_obj_close(j);
       json_obj_close(j);
       HTTP_OK_FREE(c, json_finish(j));
@@ -1036,7 +1063,7 @@ void handle_data_status(struct mg_connection *c, struct mg_http_message *hm) {
                  "connection status\"}");
     }
   } else if (hm->method.len == 4 && memcmp(hm->method.buf, "POST", 4) == 0) {
-    /* POST - 设置数据连接状态 */
+    /* POST - 设置数据连接状态（用户意图） */
     int active = 0;
     int val = 0;
     if (mg_json_get_bool(hm->body, "$.active", &val)) {
@@ -1046,7 +1073,7 @@ void handle_data_status(struct mg_connection *c, struct mg_http_message *hm) {
       return;
     }
 
-    if (ofono_set_data_status(active) == 0) {
+    if (ofono_set_data_status_ex(active, 1) == 0) {
       JsonBuilder *j = json_new();
       json_obj_open(j);
       json_add_str(j, "status", "ok");
@@ -1056,6 +1083,7 @@ void handle_data_status(struct mg_connection *c, struct mg_http_message *hm) {
       json_add_str(j, "message", msg);
       json_key_obj_open(j, "data");
       json_add_bool(j, "active", active);
+      json_add_bool(j, "user_disabled", ofono_user_data_disabled());
       json_obj_close(j);
       json_obj_close(j);
       HTTP_OK_FREE(c, json_finish(j));
@@ -1066,6 +1094,79 @@ void handle_data_status(struct mg_connection *c, struct mg_http_message *hm) {
   } else {
     HTTP_ERROR(c, 405, "Method not allowed");
   }
+}
+
+/* GET /api/connectivity - 双栈连通性探测（只读，不触发 bounce） */
+void handle_connectivity(struct mg_connection *c, struct mg_http_message *hm) {
+  HTTP_CHECK_GET(c, hm);
+
+  OfonoConnectivityProbe probe;
+  int age_ms = -1;
+  int stale = 1;
+
+  if (ofono_probe_connectivity_ex(&probe, &age_ms, &stale) != 0) {
+    HTTP_ERROR(c, 500, "connectivity probe failed");
+    return;
+  }
+
+  JsonBuilder *j = json_new();
+  json_obj_open(j);
+  json_add_str(j, "status", "ok");
+  json_key_obj_open(j, "data");
+
+  json_key_obj_open(j, "ipv4");
+  json_add_bool(j, "success", probe.ipv4.success);
+  json_add_str(j, "target", probe.ipv4.target);
+  if (probe.ipv4.success)
+    json_add_double(j, "latency_ms", probe.ipv4.latency_ms);
+  else if (probe.ipv4.error[0])
+    json_add_str(j, "error", probe.ipv4.error);
+  json_obj_close(j);
+
+  json_key_obj_open(j, "ipv6");
+  json_add_bool(j, "success", probe.ipv6.success);
+  json_add_str(j, "target", probe.ipv6.target);
+  if (probe.ipv6.success)
+    json_add_double(j, "latency_ms", probe.ipv6.latency_ms);
+  else if (probe.ipv6.error[0])
+    json_add_str(j, "error", probe.ipv6.error);
+  json_obj_close(j);
+
+  json_add_int(j, "age_ms", age_ms);
+  json_add_bool(j, "stale", stale);
+
+  json_obj_close(j); /* data */
+  json_obj_close(j); /* root */
+  HTTP_OK_FREE(c, json_finish(j));
+}
+
+/* GET /api/watchdog - Watchdog 可观测性快照（只读，不触发 heal/escalate） */
+void handle_watchdog(struct mg_connection *c, struct mg_http_message *hm) {
+  HTTP_CHECK_GET(c, hm);
+
+  OfonoWatchdogSnapshot snap;
+  if (ofono_get_watchdog_snapshot(&snap) != 0) {
+    HTTP_ERROR(c, 500, "watchdog snapshot failed");
+    return;
+  }
+
+  JsonBuilder *j = json_new();
+  json_obj_open(j);
+  json_add_str(j, "status", "ok");
+  json_key_obj_open(j, "data");
+
+  json_add_bool(j, "running", snap.running);
+  json_add_int(j, "partial_streak", snap.partial_streak);
+  json_add_int(j, "total_streak", snap.total_streak);
+  json_add_int(j, "reboot_used", snap.reboot_used);
+  json_add_int(j, "reboot_max", snap.reboot_max);
+  json_add_bool(j, "pending", snap.pending);
+  json_add_str(j, "status", snap.status);
+  json_add_str(j, "accounting_day", snap.accounting_day);
+
+  json_obj_close(j); /* data */
+  json_obj_close(j); /* root */
+  HTTP_OK_FREE(c, json_finish(j));
 }
 
 /* GET/POST /api/roaming - 漫游开关 */

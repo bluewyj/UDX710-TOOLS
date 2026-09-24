@@ -35,6 +35,13 @@ int ofono_is_initialized(void);
 void ofono_deinit(void);
 
 /**
+ * 通过 modem 串口发送 USB share AT（对齐 enable-usb-share-at.sh）
+ * 等待 /dev/stty_lte30 最多约 30s，最多 5 次写入；失败不阻断管理面启动
+ * @return 成功返回 0，失败返回 -1
+ */
+int ofono_enable_usb_share_at(void);
+
+/**
  * 获取网络模式
  * @param modem_path modem 路径，如 "/ril_0"
  * @param buffer 输出缓冲区
@@ -110,6 +117,15 @@ int ofono_get_data_status(int *active);
  * @return 成功返回0，失败返回错误码
  */
 int ofono_set_data_status(int active);
+
+/**
+ * 设置数据连接；user_request=1 表示来自用户 API（写/清 /mnt/data/user_data_off）
+ * user_request=0 为内部自愈/bounce/APN，不得污染用户关闭意图；若用户已关闭则拒绝激活
+ */
+int ofono_set_data_status_ex(int active, int user_request);
+
+/** 用户是否已显式关闭移动数据（持久标志存在） */
+int ofono_user_data_disabled(void);
 
 /**
  * 获取漫游状态
@@ -201,6 +217,61 @@ int ofono_get_serving_cell_info(char *tech, int tech_size, int *band);
 
 /* ==================== 数据连接 Watchdog API ==================== */
 
+typedef struct {
+  int success;           /* 1/0 */
+  char target[64];
+  double latency_ms;     /* 成功时填；失败可 0 */
+  char error[128];       /* 失败时非空 */
+} OfonoProbeResult;
+
+typedef struct {
+  OfonoProbeResult ipv4;
+  OfonoProbeResult ipv6;
+} OfonoConnectivityProbe;
+
+/**
+ * 双栈连通性探测：短锁拷贝共享 TTL 快照（不在调用线程 ping；不得 bounce）
+ * 冷启动无快照时返回 success=0 + cache miss，并 kick 后台刷新。
+ * @param out 输出探测结果
+ * @return 成功返回 0，参数无效返回 -1
+ */
+int ofono_probe_connectivity(OfonoConnectivityProbe *out);
+
+/**
+ * 同 ofono_probe_connectivity，并在同一把锁内填充缓存元数据
+ * 冷启动：*age_ms=-1，*stale=1
+ * @param age_ms 可为 NULL
+ * @param stale 可为 NULL；1=冷启动或 TTL 过期
+ */
+int ofono_probe_connectivity_ex(OfonoConnectivityProbe *out, int *age_ms,
+                                int *stale);
+
+/**
+ * 读取出口探测缓存元数据（短锁）
+ * 冷启动无有效快照：*age_ms=-1，*stale=1；过期快照：*stale=1 且 age_ms 为实际年龄。
+ * @param age_ms 可为 NULL；有效快照时为距上次刷新的毫秒数，冷启动为 -1
+ * @param stale 可为 NULL；1=冷启动或 TTL 过期，0=新鲜
+ */
+void ofono_get_egress_cache_meta(int *age_ms, int *stale);
+
+/**
+ * 启动出口探测共享缓存 worker（锁外 ping；TTL 刷新）
+ * @return 成功 0，创建线程失败 -1
+ */
+int ofono_start_egress_probe_cache(void);
+
+/**
+ * 停止出口探测共享缓存 worker（broadcast + join）
+ */
+void ofono_stop_egress_probe_cache(void);
+
+/**
+ * 强制失效快照并等待新一代刷新完成（供 bounce 末尾校验）
+ * @param timeout_ms 等待上限毫秒
+ * @return 1 可达，0 不可达或超时
+ */
+int ofono_egress_reachable_fresh(int timeout_ms);
+
 /**
  * 获取网络注册状态
  * @param status 输出状态字符串 (如 "registered", "roaming", "searching")
@@ -210,9 +281,22 @@ int ofono_get_serving_cell_info(char *tech, int tech_size, int *band);
 int ofono_get_network_status(char *status, int size);
 
 /**
+ * PDP context Active false→true（等同 apn-boot-apply bounce-pdp dbus 序列）
+ * @return 成功且 Active 返回 0，否则 -1
+ */
+int ofono_bounce_pdp_context(void);
+
+/**
+ * 强制 PDP 翻转（watchdog 用，含 90s 冷却与 egress 校验）
+ * @return 成功 0，失败 -1，冷却中 -2
+ */
+int ofono_bounce_pdp(void);
+
+/**
  * 检查并恢复数据连接
+ * - 用户已显式关闭移动数据 → 跳过激活（不报失败）
  * - APN 已配置且 Active=false → 尝试激活
- * - Active=true 但公网 ICMP 不可达 → bounce PDP（false→true），冷却 90s
+ * - Active=true 但公网 ICMP 不可达 → 由 watchdog streak 触发 bounce（本函数不立即 bounce）
  * @param result 输出结果描述字符串
  * @param size 缓冲区大小
  * @return 成功返回0，失败返回错误码
@@ -238,6 +322,27 @@ void ofono_stop_data_watchdog(void);
  * @deprecated 请使用 ofono_is_data_monitor_running()
  */
 int ofono_is_watchdog_running(void);
+
+/**
+ * Watchdog 可观测性快照（只读；不触发 heal/escalate）
+ */
+typedef struct {
+  int running;
+  int partial_streak;
+  int total_streak;
+  int reboot_used;
+  int reboot_max;
+  int pending;
+  char status[256];
+  char accounting_day[16];
+} OfonoWatchdogSnapshot;
+
+/**
+ * 获取 Watchdog 运行态快照（短临界区拷贝标量/status；预算文件在锁外读取）
+ * @param out 输出快照
+ * @return 成功返回 0，out 为 NULL 返回 -1
+ */
+int ofono_get_watchdog_snapshot(OfonoWatchdogSnapshot *out);
 
 /* ==================== 数据连接监听 API (DBus 信号驱动) ==================== */
 
