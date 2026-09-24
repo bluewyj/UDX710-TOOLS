@@ -279,7 +279,9 @@ static void http_handler(struct mg_connection *c, int ev, void *ev_data) {
       handle_update_check(c, hm);
     }
     /* USB模式切换 API */
-    else if (mg_match(hm->uri, mg_str("/api/usb/mode"), NULL)) {
+    else if (mg_match(hm->uri, mg_str("/api/usb/mode/restore-safe"), NULL)) {
+      handle_usb_mode_restore_safe(c, hm);
+    } else if (mg_match(hm->uri, mg_str("/api/usb/mode"), NULL)) {
       if (hm->method.len == 3 && memcmp(hm->method.buf, "GET", 3) == 0) {
         handle_usb_mode_get(c, hm);
       } else {

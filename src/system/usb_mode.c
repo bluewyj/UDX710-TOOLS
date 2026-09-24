@@ -227,6 +227,32 @@ void handle_usb_mode_set(struct mg_connection *c, struct mg_http_message *hm) {
     HTTP_OK_FREE(c, json_finish(j));
 }
 
+/* 恢复永久 RNDIS 安全档：set → switch_advanced → ensure_rndis_link */
+int usb_mode_restore_safe(int *applied_immediately) {
+    if (applied_immediately)
+        *applied_immediately = 0;
+
+    /* 永久写入 RNDIS 并清除临时覆盖；失败则不热切 */
+    if (usb_mode_set(USB_MODE_RNDIS, 1) != 0) {
+        printf("[usb_mode] restore_safe: set permanent RNDIS failed\n");
+        return -1;
+    }
+
+    /* 热切失败：配置已写入，不回滚，返回需重启 */
+    if (usb_mode_switch_advanced(USB_MODE_RNDIS) != 0) {
+        printf("[usb_mode] restore_safe: hot switch failed, reboot required\n");
+        return 1;
+    }
+
+    /* 热切成功后再次 ensure class（幂等；已是永久 RNDIS 时仍走此路径） */
+    (void)usb_mode_ensure_rndis_link();
+
+    if (applied_immediately)
+        *applied_immediately = 1;
+    printf("[usb_mode] restore_safe: permanent RNDIS applied immediately\n");
+    return 0;
+}
+
 /* ==================== USB 热切换实现 ==================== */
 
 /* 写入 sysfs 文件 */
@@ -760,4 +786,41 @@ void handle_usb_advance(struct mg_connection *c, struct mg_http_message *hm) {
     if (ret != 0) {
         printf("[usb_mode] 热切换失败: %d\n", ret);
     }
+}
+
+/* POST /api/usb/mode/restore-safe - 恢复永久 RNDIS 安全档 */
+void handle_usb_mode_restore_safe(struct mg_connection *c, struct mg_http_message *hm) {
+    HTTP_CHECK_POST(c, hm);
+
+    int applied_immediately = 0;
+    int ret = usb_mode_restore_safe(&applied_immediately);
+
+    if (ret < 0) {
+        JsonBuilder *j = json_new();
+        json_obj_open(j);
+        json_add_int(j, "Code", 1);
+        json_add_str(j, "Error", "恢复RNDIS安全档失败");
+        json_add_null(j, "Data");
+        json_obj_close(j);
+        HTTP_OK_FREE(c, json_finish(j));
+        return;
+    }
+
+    JsonBuilder *j = json_new();
+    json_obj_open(j);
+    json_add_int(j, "Code", 0);
+    json_add_str(j, "Error", "");
+    json_key_obj_open(j, "Data");
+    json_add_str(j, "mode", "rndis");
+    json_add_bool(j, "permanent", 1);
+    json_add_bool(j, "applied_immediately", applied_immediately);
+    if (applied_immediately) {
+        json_add_str(j, "message", "已恢复为永久RNDIS并立即生效");
+    } else {
+        json_add_str(j, "message", "配置已写入，重启后生效");
+    }
+    json_obj_close(j);
+    json_obj_close(j);
+
+    HTTP_OK_FREE(c, json_finish(j));
 }

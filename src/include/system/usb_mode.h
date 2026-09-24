@@ -75,10 +75,18 @@ int usb_mode_get_current_hardware(void);
  */
 int usb_mode_ensure_rndis_link(void);
 
+/**
+ * @brief 恢复永久 RNDIS 安全档：写永久配置、清临时、尽力热切并 ensure class
+ * @param applied_immediately 非 NULL 时写出是否立即生效 (1=是, 0=否/需重启)
+ * @return 0=ok立即生效, 1=ok需重启, <0=失败
+ */
+int usb_mode_restore_safe(int *applied_immediately);
+
 /* HTTP API处理函数 */
 void handle_usb_mode_get(struct mg_connection *c, struct mg_http_message *hm);
 void handle_usb_mode_set(struct mg_connection *c, struct mg_http_message *hm);
 void handle_usb_advance(struct mg_connection *c, struct mg_http_message *hm);
+void handle_usb_mode_restore_safe(struct mg_connection *c, struct mg_http_message *hm);
 
 #ifdef __cplusplus
 }
