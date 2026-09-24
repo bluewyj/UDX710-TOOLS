@@ -1134,6 +1134,35 @@ void handle_connectivity(struct mg_connection *c, struct mg_http_message *hm) {
   HTTP_OK_FREE(c, json_finish(j));
 }
 
+/* GET /api/watchdog - Watchdog 可观测性快照（只读，不触发 heal/escalate） */
+void handle_watchdog(struct mg_connection *c, struct mg_http_message *hm) {
+  HTTP_CHECK_GET(c, hm);
+
+  OfonoWatchdogSnapshot snap;
+  if (ofono_get_watchdog_snapshot(&snap) != 0) {
+    HTTP_ERROR(c, 500, "watchdog snapshot failed");
+    return;
+  }
+
+  JsonBuilder *j = json_new();
+  json_obj_open(j);
+  json_add_str(j, "status", "ok");
+  json_key_obj_open(j, "data");
+
+  json_add_bool(j, "running", snap.running);
+  json_add_int(j, "partial_streak", snap.partial_streak);
+  json_add_int(j, "total_streak", snap.total_streak);
+  json_add_int(j, "reboot_used", snap.reboot_used);
+  json_add_int(j, "reboot_max", snap.reboot_max);
+  json_add_bool(j, "pending", snap.pending);
+  json_add_str(j, "status", snap.status);
+  json_add_str(j, "accounting_day", snap.accounting_day);
+
+  json_obj_close(j); /* data */
+  json_obj_close(j); /* root */
+  HTTP_OK_FREE(c, json_finish(j));
+}
+
 /* GET/POST /api/roaming - 漫游开关 */
 void handle_roaming_status(struct mg_connection *c,
                            struct mg_http_message *hm) {

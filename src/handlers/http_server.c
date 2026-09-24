@@ -169,6 +169,8 @@ static void http_handler(struct mg_connection *c, int ev, void *ev_data) {
       handle_info(c, hm);
     } else if (mg_match(hm->uri, mg_str("/api/connectivity"), NULL)) {
       handle_connectivity(c, hm);
+    } else if (mg_match(hm->uri, mg_str("/api/watchdog"), NULL)) {
+      handle_watchdog(c, hm);
     } else if (mg_match(hm->uri, mg_str("/api/at"), NULL)) {
       handle_execute_at(c, hm);
     } else if (mg_match(hm->uri, mg_str("/api/set_network"), NULL)) {
