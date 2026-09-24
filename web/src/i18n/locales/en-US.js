@@ -261,6 +261,8 @@ export default {
     connectionStatus: 'Connection Status',
     active: 'Active',
     inactive: 'Inactive',
+    guidanceNotApplied: 'This template is not applied to the modem yet. Save/apply it before checking connection status.',
+    guidanceAppliedInactive: 'Config is applied, but the data connection is inactive. Registration alone does not mean data is on—open Mobile Data on the Network page, or wait for dial-up.',
     lastTemplateHint: 'This is the last template and is currently in use. You need to switch to auto mode before deleting. Switch automatically?',
     activeTemplateHint: 'This template is currently in use. You need to switch to auto mode before deleting. Switch automatically?',
     switchedToAuto: 'Switched to auto mode and deleted template',

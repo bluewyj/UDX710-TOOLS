@@ -43,6 +43,14 @@ const selectedTemplate = computed(() =>
   templates.value.find(t => t.id === selectedTemplateId.value)
 )
 
+const guidanceKind = computed(() => {
+  const tpl = currentTemplate.value
+  if (!tpl) return null
+  if (!tpl.is_applied) return 'not_applied'
+  if (!tpl.is_active) return 'applied_inactive'
+  return 'active'
+})
+
 // API请求头
 function getHeaders(json = false) {
   const token = localStorage.getItem('auth_token')
@@ -466,6 +474,19 @@ onMounted(async () => {
             <div v-if="currentTemplate && currentTemplate.is_applied && currentTemplate.applied_context" class="flex justify-between p-3 bg-slate-50 dark:bg-white/5 rounded-xl">
               <span class="text-slate-600 dark:text-white/60">Context</span>
               <span class="text-slate-900 dark:text-white font-mono text-sm">{{ currentTemplate.applied_context }}</span>
+            </div>
+            <div
+              v-if="guidanceKind === 'not_applied' || guidanceKind === 'applied_inactive'"
+              class="p-3 bg-blue-50 dark:bg-blue-500/10 rounded-xl border border-blue-200 dark:border-blue-500/20"
+            >
+              <div class="flex items-start space-x-3">
+                <i class="fas fa-info-circle text-blue-500 mt-0.5"></i>
+                <p class="text-blue-800 dark:text-blue-200 text-sm leading-relaxed">
+                  {{ guidanceKind === 'not_applied'
+                    ? (t('apn.guidanceNotApplied') || '')
+                    : (t('apn.guidanceAppliedInactive') || '') }}
+                </p>
+              </div>
             </div>
           </div>
         </div>
