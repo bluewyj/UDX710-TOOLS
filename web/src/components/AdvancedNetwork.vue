@@ -69,9 +69,28 @@ function isRecommended(cell) {
          cell.rat === recommendedCell.value.rat
 }
 
+// 缺省/旧响应：视为支持，保持改前行为；capability_unknown 时各项已为 supported=true
+function isBandSupported(band) {
+  if (band.supported === false) return false
+  return true
+}
+
+function isBandSelectable(band) {
+  return isBandSupported(band)
+}
+
+function toggleBand(band) {
+  if (!isBandSelectable(band)) return
+  band.locked = !band.locked
+}
+
 const selectedBandsCount = computed(() => {
   let count = 0
-  Object.values(bands.value).forEach(group => group.forEach(band => { if (band.locked) count++ }))
+  Object.values(bands.value).forEach(group =>
+    group.forEach(band => {
+      if (band.locked && isBandSelectable(band)) count++
+    })
+  )
   return count
 })
 
@@ -84,7 +103,11 @@ async function fetchBands() {
 
 async function handleLockBands() {
   const selectedBands = []
-  Object.values(bands.value).forEach(group => group.forEach(band => { if (band.locked) selectedBands.push(band.name) }))
+  Object.values(bands.value).forEach(group =>
+    group.forEach(band => {
+      if (band.locked && isBandSelectable(band)) selectedBands.push(band.name)
+    })
+  )
   if (selectedBands.length === 0) { showError(t('advanced.selectAtLeastOne')); return }
   lockingBands.value = true
   try { await apiLockBands(selectedBands); success(t('advanced.lockedBands', { count: selectedBands.length })); await fetchBands() }
@@ -192,9 +215,20 @@ onMounted(() => { fetchBands(); fetchCells() })
           <span class="text-slate-400 dark:text-white/40 text-xs">{{ bands['4G_TDD'].filter(b => b.locked).length }}/{{ bands['4G_TDD'].length }}</span>
         </div>
         <div class="grid grid-cols-4 sm:grid-cols-5 md:grid-cols-6 gap-2">
-          <button v-for="band in bands['4G_TDD']" :key="band.name" @click="band.locked = !band.locked"
-            class="relative p-2 rounded-xl border-2 transition-all hover:scale-105"
-            :class="band.locked ? 'bg-blue-50 dark:bg-blue-500/20 border-blue-500 shadow-md shadow-blue-500/20' : 'bg-slate-50 dark:bg-white/5 border-slate-200 dark:border-white/10 hover:border-blue-300 dark:hover:border-blue-500/50'">
+          <button
+            v-for="band in bands['4G_TDD']"
+            :key="band.name"
+            @click="toggleBand(band)"
+            class="relative p-2 rounded-xl border-2 transition-all"
+            :class="[
+              !isBandSelectable(band)
+                ? 'opacity-40 cursor-not-allowed bg-slate-100 dark:bg-white/5 border-slate-200 dark:border-white/10'
+                : band.locked
+                  ? 'bg-blue-50 dark:bg-blue-500/20 border-blue-500 shadow-md shadow-blue-500/20 hover:scale-105'
+                  : 'bg-slate-50 dark:bg-white/5 border-slate-200 dark:border-white/10 hover:border-blue-300 dark:hover:border-blue-500/50 hover:scale-105'
+            ]"
+            :title="!isBandSelectable(band) ? t('advanced.bandUnsupported') : undefined"
+          >
             <div v-if="band.locked" class="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-blue-500 flex items-center justify-center">
               <i class="fas fa-check text-white text-[8px]"></i>
             </div>
@@ -212,9 +246,20 @@ onMounted(() => { fetchBands(); fetchCells() })
           <span class="text-slate-400 dark:text-white/40 text-xs">{{ bands['4G_FDD'].filter(b => b.locked).length }}/{{ bands['4G_FDD'].length }}</span>
         </div>
         <div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 gap-2">
-          <button v-for="band in bands['4G_FDD']" :key="band.name" @click="band.locked = !band.locked"
-            class="relative p-2 rounded-xl border-2 transition-all hover:scale-105"
-            :class="band.locked ? 'bg-green-50 dark:bg-green-500/20 border-green-500 shadow-md shadow-green-500/20' : 'bg-slate-50 dark:bg-white/5 border-slate-200 dark:border-white/10 hover:border-green-300 dark:hover:border-green-500/50'">
+          <button
+            v-for="band in bands['4G_FDD']"
+            :key="band.name"
+            @click="toggleBand(band)"
+            class="relative p-2 rounded-xl border-2 transition-all"
+            :class="[
+              !isBandSelectable(band)
+                ? 'opacity-40 cursor-not-allowed bg-slate-100 dark:bg-white/5 border-slate-200 dark:border-white/10'
+                : band.locked
+                  ? 'bg-green-50 dark:bg-green-500/20 border-green-500 shadow-md shadow-green-500/20 hover:scale-105'
+                  : 'bg-slate-50 dark:bg-white/5 border-slate-200 dark:border-white/10 hover:border-green-300 dark:hover:border-green-500/50 hover:scale-105'
+            ]"
+            :title="!isBandSelectable(band) ? t('advanced.bandUnsupported') : undefined"
+          >
             <div v-if="band.locked" class="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-green-500 flex items-center justify-center">
               <i class="fas fa-check text-white text-[8px]"></i>
             </div>
@@ -232,9 +277,20 @@ onMounted(() => { fetchBands(); fetchCells() })
           <span class="text-slate-400 dark:text-white/40 text-xs">{{ bands['5G'].filter(b => b.locked).length }}/{{ bands['5G'].length }}</span>
         </div>
         <div class="grid grid-cols-4 sm:grid-cols-6 md:grid-cols-8 gap-2">
-          <button v-for="band in bands['5G']" :key="band.name" @click="band.locked = !band.locked"
-            class="relative p-2 rounded-xl border-2 transition-all hover:scale-105"
-            :class="band.locked ? 'bg-purple-50 dark:bg-purple-500/20 border-purple-500 shadow-md shadow-purple-500/20' : 'bg-slate-50 dark:bg-white/5 border-slate-200 dark:border-white/10 hover:border-purple-300 dark:hover:border-purple-500/50'">
+          <button
+            v-for="band in bands['5G']"
+            :key="band.name"
+            @click="toggleBand(band)"
+            class="relative p-2 rounded-xl border-2 transition-all"
+            :class="[
+              !isBandSelectable(band)
+                ? 'opacity-40 cursor-not-allowed bg-slate-100 dark:bg-white/5 border-slate-200 dark:border-white/10'
+                : band.locked
+                  ? 'bg-purple-50 dark:bg-purple-500/20 border-purple-500 shadow-md shadow-purple-500/20 hover:scale-105'
+                  : 'bg-slate-50 dark:bg-white/5 border-slate-200 dark:border-white/10 hover:border-purple-300 dark:hover:border-purple-500/50 hover:scale-105'
+            ]"
+            :title="!isBandSelectable(band) ? t('advanced.bandUnsupported') : undefined"
+          >
             <div v-if="band.locked" class="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-purple-500 flex items-center justify-center">
               <i class="fas fa-check text-white text-[8px]"></i>
             </div>
