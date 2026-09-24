@@ -1519,6 +1519,7 @@ int ofono_get_serving_cell_info(char *tech, int tech_size, int *band) {
 static pthread_t g_watchdog_thread = 0;
 static volatile int g_watchdog_running = 0;
 static int g_watchdog_interval = 10; /* 默认10秒 */
+static pthread_mutex_t g_watchdog_snap_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char g_last_watchdog_status[256] = {0};
 static time_t g_outage_boot_ts = 0;
 static int g_partial_streak = 0;
@@ -2434,6 +2435,31 @@ void ofono_stop_data_watchdog(void) {
  * 检查 Watchdog 是否运行中
  */
 int ofono_is_watchdog_running(void) { return g_watchdog_running ? 1 : 0; }
+
+/**
+ * 获取 Watchdog 可观测性快照（不改变 heal/escalate 行为）
+ */
+int ofono_get_watchdog_snapshot(OfonoWatchdogSnapshot *out) {
+  if (!out)
+    return -1;
+
+  memset(out, 0, sizeof(*out));
+
+  /* 短临界区：仅拷贝内存态；禁止持锁 fopen */
+  pthread_mutex_lock(&g_watchdog_snap_mutex);
+  out->running = g_watchdog_running ? 1 : 0;
+  out->partial_streak = g_partial_streak;
+  out->total_streak = g_total_streak;
+  strncpy(out->status, g_last_watchdog_status, sizeof(out->status) - 1);
+  pthread_mutex_unlock(&g_watchdog_snap_mutex);
+
+  out->reboot_max = TOTAL_REBOOT_MAX_DAY;
+  out->reboot_used = outage_total_reboot_effective_count();
+  out->pending = (access(OUTAGE_REBOOT_PENDING_FILE, F_OK) == 0) ? 1 : 0;
+  outage_budget_accounting_day(out->accounting_day, sizeof(out->accounting_day));
+
+  return 0;
+}
 
 /* ==================== 数据连接监听实现 (DBus 信号驱动) ==================== */
 

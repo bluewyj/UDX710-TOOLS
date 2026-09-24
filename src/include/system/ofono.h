@@ -287,6 +287,27 @@ void ofono_stop_data_watchdog(void);
  */
 int ofono_is_watchdog_running(void);
 
+/**
+ * Watchdog 可观测性快照（只读；不触发 heal/escalate）
+ */
+typedef struct {
+  int running;
+  int partial_streak;
+  int total_streak;
+  int reboot_used;
+  int reboot_max;
+  int pending;
+  char status[256];
+  char accounting_day[16];
+} OfonoWatchdogSnapshot;
+
+/**
+ * 获取 Watchdog 运行态快照（短临界区拷贝标量/status；预算文件在锁外读取）
+ * @param out 输出快照
+ * @return 成功返回 0，out 为 NULL 返回 -1
+ */
+int ofono_get_watchdog_snapshot(OfonoWatchdogSnapshot *out);
+
 /* ==================== 数据连接监听 API (DBus 信号驱动) ==================== */
 
 /**
