@@ -44,6 +44,15 @@ void handle_info(struct mg_connection *c, struct mg_http_message *hm) {
   json_add_str(j, "sim_slot", info.sim_slot);
   json_add_str(j, "signal_strength", info.signal_strength);
   json_add_double(j, "thermal_temp", info.thermal_temp);
+  json_arr_open(j, "thermal_zones");
+  for (int i = 0; i < info.thermal_zone_count; i++) {
+    json_arr_obj_open(j);
+    json_add_str(j, "zone", info.thermal_zones[i].zone);
+    json_add_str(j, "type", info.thermal_zones[i].type);
+    json_add_double(j, "temperature", info.thermal_zones[i].temperature);
+    json_obj_close(j);
+  }
+  json_arr_close(j);
   json_add_str(j, "power_status", info.power_status);
   json_add_str(j, "battery_health", info.battery_health);
   json_add_int(j, "battery_capacity", info.battery_capacity);
