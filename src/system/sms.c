@@ -26,6 +26,8 @@ static WebhookConfig g_webhook_config = {0};
 /* 最大短信存储数量 */
 #define DEFAULT_MAX_SMS_COUNT 50
 #define DEFAULT_MAX_SENT_COUNT 10
+/* 同 sender+content 去重窗口（秒） */
+#define SMS_DEDUP_WINDOW_S 60
 static int g_max_sms_count = DEFAULT_MAX_SMS_COUNT;
 static int g_max_sent_count = DEFAULT_MAX_SENT_COUNT;
 
@@ -45,6 +47,7 @@ static void on_incoming_message(GDBusConnection *conn, const gchar *sender_name,
     GVariant *parameters, gpointer user_data);
 static int save_sms_to_db(const char *sender, const char *content, time_t timestamp);
 static int save_sent_sms_to_db(const char *recipient, const char *content, time_t timestamp, const char *status);
+static int sms_is_duplicate(const char *sender, const char *content, time_t now);
 static void send_webhook_notification(const SmsMessage *msg);
 static void load_sms_config(void);
 static void subscribe_sms_signal(void);
@@ -109,6 +112,32 @@ static int save_sms_to_db(const char *sender, const char *content, time_t timest
     }
     
     return ret;
+}
+
+/**
+ * 60 秒窗口内同 sender+content 去重。
+ * @return 1 重复；0 非重复或查询失败（fail-open，允许入库）
+ */
+static int sms_is_duplicate(const char *sender, const char *content, time_t now) {
+    char sql[2048];
+    char escaped_sender[128];
+    char escaped_content[1024];
+    time_t cutoff;
+
+    if (!sender || !content) {
+        return 0;
+    }
+
+    db_escape_string(sender, escaped_sender, sizeof(escaped_sender));
+    db_escape_string(content, escaped_content, sizeof(escaped_content));
+
+    cutoff = now - (time_t)SMS_DEDUP_WINDOW_S;
+    snprintf(sql, sizeof(sql),
+        "SELECT 1 FROM sms WHERE sender='%s' AND content='%s' AND timestamp >= %ld LIMIT 1;",
+        escaped_sender, escaped_content, (long)cutoff);
+
+    /* default_val=0：查询失败/无行 → 非重复，失败开放 */
+    return db_query_int(sql, 0) == 1 ? 1 : 0;
 }
 
 /* 订阅短信信号 */
@@ -241,8 +270,14 @@ static void on_incoming_message(GDBusConnection *conn, const gchar *sender_name,
     
     printf("[SMS] 新短信 - 发件人: %s, 内容: %s\n", sender, content);
     
-    /* 保存到数据库 */
     time_t now = time(NULL);
+    if (sms_is_duplicate(sender, content, now)) {
+        printf("[SMS] 60秒内重复短信，跳过入库与Webhook: sender=%s\n", sender);
+        g_variant_unref(props);
+        return;
+    }
+
+    /* 保存到数据库 */
     if (save_sms_to_db(sender, content, now) == 0) {
         printf("[SMS] 短信已保存到数据库\n");
         
@@ -391,9 +426,18 @@ static void send_webhook_notification(const SmsMessage *msg) {
 /* 初始化短信模块 */
 int sms_init(const char *db_path) {
     GError *error = NULL;
+    const char *tz;
     
     if (g_sms_initialized) {
         return 0;
+    }
+
+    /* 未设置 TZ 时默认 Asia/Shanghai，供 webhook #{time}/localtime 使用 */
+    tz = getenv("TZ");
+    if (tz == NULL || tz[0] == '\0') {
+        setenv("TZ", "Asia/Shanghai", 0);
+        tzset();
+        printf("[SMS] TZ 未设置，默认 Asia/Shanghai\n");
     }
     
     printf("[SMS] 初始化短信模块\n");
