@@ -891,14 +891,89 @@ void handle_update_extract(struct mg_connection *c,
   }
 }
 
-/* POST /api/update/install - 执行安装并重启 */
+/* GET /api/update/status - OTA 状态（当前版本 + pending） */
+void handle_update_status(struct mg_connection *c,
+                          struct mg_http_message *hm) {
+  HTTP_CHECK_GET(c, hm);
+
+  update_status_t st;
+  if (update_get_status(&st) != 0) {
+    HTTP_ERROR(c, 500, "获取更新状态失败");
+    return;
+  }
+
+  JsonBuilder *j = json_new();
+  json_obj_open(j);
+  json_add_str(j, "current_version", st.current_version);
+  json_add_bool(j, "pending_update", st.pending);
+  json_add_str(j, "pending_kind", st.kind);
+  if (st.meta_version[0]) {
+    json_key_obj_open(j, "pending_meta");
+    json_add_str(j, "version", st.meta_version);
+    json_obj_close(j);
+  }
+  json_obj_close(j);
+  HTTP_OK_FREE(c, json_finish(j));
+}
+
+/* POST /api/update/cancel - 取消待应用更新 */
+void handle_update_cancel(struct mg_connection *c,
+                          struct mg_http_message *hm) {
+  HTTP_CHECK_POST(c, hm);
+
+  if (update_cancel() == 0) {
+    HTTP_SUCCESS(c, "已取消待应用更新");
+  } else {
+    HTTP_ERROR(c, 500, "取消失败");
+  }
+}
+
+/* POST /api/update/apply - 应用待更新；body.restart_now 缺省 false */
+void handle_update_apply(struct mg_connection *c,
+                         struct mg_http_message *hm) {
+  HTTP_CHECK_POST(c, hm);
+
+  int restart_now = 0;
+  int val = 0;
+  if (mg_json_get_bool(hm->body, "$.restart_now", &val)) {
+    restart_now = val ? 1 : 0;
+  } else {
+    long n = mg_json_get_long(hm->body, "$.restart_now", 0);
+    restart_now = (n != 0) ? 1 : 0;
+  }
+
+  char output[2048] = {0};
+  if (update_apply(restart_now, output, sizeof(output)) == 0) {
+    JsonBuilder *j = json_new();
+    json_obj_open(j);
+    json_add_str(j, "status", "success");
+    json_add_str(j, "message",
+                 restart_now ? "应用成功，正在重启..." : "应用成功");
+    json_add_str(j, "output", output);
+    json_add_bool(j, "restart_now", restart_now);
+    json_obj_close(j);
+    HTTP_OK_FREE(c, json_finish(j));
+    if (restart_now) {
+      c->is_draining = 1;
+    }
+  } else {
+    JsonBuilder *j = json_new();
+    json_obj_open(j);
+    json_add_str(j, "error", "应用失败");
+    json_add_str(j, "output", output);
+    json_obj_close(j);
+    HTTP_JSON_FREE(c, 500, json_finish(j));
+  }
+}
+
+/* POST /api/update/install - 执行安装并重启（兼容旧客户端） */
 void handle_update_install(struct mg_connection *c,
                            struct mg_http_message *hm) {
   HTTP_CHECK_POST(c, hm);
 
   char output[2048] = {0};
 
-  if (update_install(output, sizeof(output)) == 0) {
+  if (update_apply(1, output, sizeof(output)) == 0) {
     JsonBuilder *j = json_new();
     json_obj_open(j);
     json_add_str(j, "status", "success");
@@ -907,8 +982,6 @@ void handle_update_install(struct mg_connection *c,
     json_obj_close(j);
     HTTP_OK_FREE(c, json_finish(j));
     c->is_draining = 1;
-    sleep(2);
-    device_reboot();
   } else {
     JsonBuilder *j = json_new();
     json_obj_open(j);
