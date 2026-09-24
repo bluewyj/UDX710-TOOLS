@@ -13,6 +13,7 @@
 #include "dbus_core.h"
 #include "sysinfo.h"
 #include "usb_mode.h"
+#include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -1602,6 +1603,8 @@ int ofono_get_network_status(char *status, int size) {
 
 /* 壳侧 egress 探测：Active=true 不等于用户面可用（zombie Active）。 */
 #define OFONO_EGRESS_BOUNCE_COOLDOWN_S 90
+#define EGRESS_PROBE_TTL_S 8
+#define EGRESS_PROBE_WAIT_MS 3000
 
 static time_t g_last_egress_bounce_ts = 0;
 
@@ -1614,29 +1617,65 @@ static const char *const OFONO_EGRESS_IPV4_TARGETS[] = {
 
 #define OFONO_CONNECTIVITY_IPV6_TARGET "2400:3200::1"
 
-static int ofono_egress_reachable(void) {
-  size_t i;
-  char cmd[128];
-  for (i = 0; i < sizeof(OFONO_EGRESS_IPV4_TARGETS) /
-                       sizeof(OFONO_EGRESS_IPV4_TARGETS[0]);
-       i++) {
-    snprintf(cmd, sizeof(cmd), "ping -c 1 -W 2 %s >/dev/null 2>&1",
-             OFONO_EGRESS_IPV4_TARGETS[i]);
-    if (system(cmd) == 0)
-      return 1;
+/* 共享 TTL 快照：禁止与 g_ofono_mutex 嵌套；ping 仅锁外。 */
+static pthread_mutex_t g_egress_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_egress_cache_cond = PTHREAD_COND_INITIALIZER;
+static pthread_t g_egress_probe_tid;
+static int g_egress_probe_running;
+static int g_egress_probe_stop;
+static int g_egress_refreshing;
+static int g_egress_kick;
+static unsigned g_egress_generation;
+static int g_egress_valid; /* 至少完成过一轮刷新 */
+static struct timeval g_egress_updated_at;
+static OfonoConnectivityProbe g_egress_snap;
+
+static void egress_deadline_from_now(struct timespec *ts, int timeout_ms) {
+  struct timeval tv;
+  long usec;
+  gettimeofday(&tv, NULL);
+  if (timeout_ms < 0)
+    timeout_ms = 0;
+  ts->tv_sec = tv.tv_sec + timeout_ms / 1000;
+  usec = tv.tv_usec + (long)(timeout_ms % 1000) * 1000L;
+  if (usec >= 1000000L) {
+    ts->tv_sec += usec / 1000000L;
+    usec %= 1000000L;
   }
-  return 0;
+  ts->tv_nsec = usec * 1000L;
 }
 
-int ofono_probe_connectivity(OfonoConnectivityProbe *out) {
+static int egress_age_ms_locked(void) {
+  struct timeval now;
+  long ms;
+  gettimeofday(&now, NULL);
+  ms = (now.tv_sec - g_egress_updated_at.tv_sec) * 1000L +
+       (now.tv_usec - g_egress_updated_at.tv_usec) / 1000L;
+  if (ms < 0)
+    return 0;
+  if (ms > 2147483647L)
+    return 2147483647;
+  return (int)ms;
+}
+
+static int egress_ttl_expired_locked(void) {
+  if (!g_egress_valid)
+    return 1;
+  return egress_age_ms_locked() >= (EGRESS_PROBE_TTL_S * 1000);
+}
+
+static void egress_probe_kick_locked(void) {
+  g_egress_kick = 1;
+  pthread_cond_broadcast(&g_egress_cache_cond);
+}
+
+/* 锁外执行双栈 ping；失败也写出不可达结论。 */
+static void egress_probe_run_unlocked(OfonoConnectivityProbe *out) {
   size_t i;
   char cmd[160];
   struct timeval t0, t1;
-  if (!out)
-    return -1;
-  memset(out, 0, sizeof(*out));
 
-  /* IPv4：短路成功 */
+  memset(out, 0, sizeof(*out));
   out->ipv4.success = 0;
   snprintf(out->ipv4.error, sizeof(out->ipv4.error), "unreachable");
   for (i = 0; i < sizeof(OFONO_EGRESS_IPV4_TARGETS) /
@@ -1651,9 +1690,8 @@ int ofono_probe_connectivity(OfonoConnectivityProbe *out) {
       gettimeofday(&t1, NULL);
       out->ipv4.success = 1;
       out->ipv4.error[0] = '\0';
-      out->ipv4.latency_ms =
-          (t1.tv_sec - t0.tv_sec) * 1000.0 +
-          (t1.tv_usec - t0.tv_usec) / 1000.0;
+      out->ipv4.latency_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                             (t1.tv_usec - t0.tv_usec) / 1000.0;
       break;
     }
   }
@@ -1662,7 +1700,6 @@ int ofono_probe_connectivity(OfonoConnectivityProbe *out) {
              OFONO_EGRESS_IPV4_TARGETS[0]);
   }
 
-  /* IPv6：固定阿里 DNS */
   snprintf(out->ipv6.target, sizeof(out->ipv6.target), "%s",
            OFONO_CONNECTIVITY_IPV6_TARGET);
   snprintf(cmd, sizeof(cmd), "ping6 -c 1 -W 2 %s >/dev/null 2>&1",
@@ -1671,14 +1708,163 @@ int ofono_probe_connectivity(OfonoConnectivityProbe *out) {
   if (system(cmd) == 0) {
     gettimeofday(&t1, NULL);
     out->ipv6.success = 1;
-    out->ipv6.latency_ms =
-        (t1.tv_sec - t0.tv_sec) * 1000.0 +
-        (t1.tv_usec - t0.tv_usec) / 1000.0;
+    out->ipv6.latency_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                           (t1.tv_usec - t0.tv_usec) / 1000.0;
   } else {
     out->ipv6.success = 0;
     snprintf(out->ipv6.error, sizeof(out->ipv6.error), "unreachable");
   }
+}
+
+static void *egress_probe_worker(void *arg) {
+  (void)arg;
+  for (;;) {
+    OfonoConnectivityProbe local;
+    int remain_ms;
+
+    pthread_mutex_lock(&g_egress_cache_mutex);
+    while (!g_egress_probe_stop && !g_egress_kick) {
+      if (!g_egress_valid) {
+        pthread_cond_wait(&g_egress_cache_cond, &g_egress_cache_mutex);
+        continue;
+      }
+      remain_ms = (EGRESS_PROBE_TTL_S * 1000) - egress_age_ms_locked();
+      if (remain_ms <= 0)
+        break; /* TTL 到期，刷新 */
+      {
+        struct timespec abstime;
+        egress_deadline_from_now(&abstime, remain_ms);
+        pthread_cond_timedwait(&g_egress_cache_cond, &g_egress_cache_mutex,
+                               &abstime);
+      }
+    }
+    if (g_egress_probe_stop) {
+      g_egress_refreshing = 0;
+      pthread_mutex_unlock(&g_egress_cache_mutex);
+      break;
+    }
+    g_egress_kick = 0;
+    g_egress_refreshing = 1;
+    pthread_mutex_unlock(&g_egress_cache_mutex);
+
+    egress_probe_run_unlocked(&local);
+
+    pthread_mutex_lock(&g_egress_cache_mutex);
+    g_egress_snap = local;
+    gettimeofday(&g_egress_updated_at, NULL);
+    g_egress_valid = 1;
+    g_egress_generation++;
+    g_egress_refreshing = 0;
+    pthread_cond_broadcast(&g_egress_cache_cond);
+    pthread_mutex_unlock(&g_egress_cache_mutex);
+  }
+  return NULL;
+}
+
+int ofono_start_egress_probe_cache(void) {
+  pthread_mutex_lock(&g_egress_cache_mutex);
+  if (g_egress_probe_running) {
+    pthread_mutex_unlock(&g_egress_cache_mutex);
+    return 0;
+  }
+  g_egress_probe_stop = 0;
+  g_egress_probe_running = 1;
+  pthread_mutex_unlock(&g_egress_cache_mutex);
+
+  if (pthread_create(&g_egress_probe_tid, NULL, egress_probe_worker, NULL) !=
+      0) {
+    pthread_mutex_lock(&g_egress_cache_mutex);
+    g_egress_probe_running = 0;
+    pthread_mutex_unlock(&g_egress_cache_mutex);
+    return -1;
+  }
   return 0;
+}
+
+void ofono_stop_egress_probe_cache(void) {
+  pthread_mutex_lock(&g_egress_cache_mutex);
+  if (!g_egress_probe_running) {
+    pthread_mutex_unlock(&g_egress_cache_mutex);
+    return;
+  }
+  g_egress_probe_stop = 1;
+  pthread_cond_broadcast(&g_egress_cache_cond);
+  pthread_mutex_unlock(&g_egress_cache_mutex);
+
+  pthread_join(g_egress_probe_tid, NULL);
+
+  pthread_mutex_lock(&g_egress_cache_mutex);
+  g_egress_probe_running = 0;
+  pthread_mutex_unlock(&g_egress_cache_mutex);
+}
+
+static int ofono_egress_reachable(void) {
+  OfonoConnectivityProbe snap;
+  int valid;
+
+  pthread_mutex_lock(&g_egress_cache_mutex);
+  valid = g_egress_valid;
+  if (valid)
+    snap = g_egress_snap;
+  if (!valid || egress_ttl_expired_locked())
+    egress_probe_kick_locked();
+  pthread_mutex_unlock(&g_egress_cache_mutex);
+
+  if (!valid)
+    return 0;
+  return snap.ipv4.success ? 1 : 0;
+}
+
+int ofono_probe_connectivity(OfonoConnectivityProbe *out) {
+  if (!out)
+    return -1;
+
+  pthread_mutex_lock(&g_egress_cache_mutex);
+  if (g_egress_valid) {
+    *out = g_egress_snap;
+    if (egress_ttl_expired_locked())
+      egress_probe_kick_locked();
+  } else {
+    memset(out, 0, sizeof(*out));
+    snprintf(out->ipv4.target, sizeof(out->ipv4.target), "%s",
+             OFONO_EGRESS_IPV4_TARGETS[0]);
+    snprintf(out->ipv6.target, sizeof(out->ipv6.target), "%s",
+             OFONO_CONNECTIVITY_IPV6_TARGET);
+    snprintf(out->ipv4.error, sizeof(out->ipv4.error), "cache miss");
+    snprintf(out->ipv6.error, sizeof(out->ipv6.error), "cache miss");
+    egress_probe_kick_locked();
+  }
+  pthread_mutex_unlock(&g_egress_cache_mutex);
+  return 0;
+}
+
+int ofono_egress_reachable_fresh(int timeout_ms) {
+  unsigned wait_for;
+  OfonoConnectivityProbe snap;
+  int got = 0;
+  struct timespec deadline;
+
+  pthread_mutex_lock(&g_egress_cache_mutex);
+  g_egress_valid = 0;
+  wait_for = g_egress_generation + 1;
+  egress_probe_kick_locked();
+  egress_deadline_from_now(&deadline, timeout_ms);
+
+  while (g_egress_generation < wait_for) {
+    int rc = pthread_cond_timedwait(&g_egress_cache_cond, &g_egress_cache_mutex,
+                                    &deadline);
+    if (rc == ETIMEDOUT)
+      break;
+  }
+  if (g_egress_generation >= wait_for && g_egress_valid) {
+    snap = g_egress_snap;
+    got = 1;
+  }
+  pthread_mutex_unlock(&g_egress_cache_mutex);
+
+  if (!got)
+    return 0;
+  return snap.ipv4.success ? 1 : 0;
 }
 
 int ofono_bounce_pdp_context(void) {
@@ -1715,7 +1901,7 @@ int ofono_bounce_pdp(void) {
     return -1;
   }
   sleep(2);
-  return ofono_egress_reachable() ? 0 : -1;
+  return ofono_egress_reachable_fresh(EGRESS_PROBE_WAIT_MS) ? 0 : -1;
 }
 
 /**

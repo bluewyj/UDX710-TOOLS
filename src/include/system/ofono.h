@@ -230,11 +230,30 @@ typedef struct {
 } OfonoConnectivityProbe;
 
 /**
- * 双栈连通性探测（仅 ping/ping6；不得拿 ofono 锁；不得 bounce）
+ * 双栈连通性探测：短锁拷贝共享 TTL 快照（不在调用线程 ping；不得 bounce）
+ * 冷启动无快照时返回 success=0 + cache miss，并 kick 后台刷新。
  * @param out 输出探测结果
  * @return 成功返回 0，参数无效返回 -1
  */
 int ofono_probe_connectivity(OfonoConnectivityProbe *out);
+
+/**
+ * 启动出口探测共享缓存 worker（锁外 ping；TTL 刷新）
+ * @return 成功 0，创建线程失败 -1
+ */
+int ofono_start_egress_probe_cache(void);
+
+/**
+ * 停止出口探测共享缓存 worker（broadcast + join）
+ */
+void ofono_stop_egress_probe_cache(void);
+
+/**
+ * 强制失效快照并等待新一代刷新完成（供 bounce 末尾校验）
+ * @param timeout_ms 等待上限毫秒
+ * @return 1 可达，0 不可达或超时
+ */
+int ofono_egress_reachable_fresh(int timeout_ms);
 
 /**
  * 获取网络注册状态
