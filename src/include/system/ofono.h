@@ -238,6 +238,23 @@ typedef struct {
 int ofono_probe_connectivity(OfonoConnectivityProbe *out);
 
 /**
+ * 同 ofono_probe_connectivity，并在同一把锁内填充缓存元数据
+ * 冷启动：*age_ms=-1，*stale=1
+ * @param age_ms 可为 NULL
+ * @param stale 可为 NULL；1=冷启动或 TTL 过期
+ */
+int ofono_probe_connectivity_ex(OfonoConnectivityProbe *out, int *age_ms,
+                                int *stale);
+
+/**
+ * 读取出口探测缓存元数据（短锁）
+ * 冷启动无有效快照：*age_ms=-1，*stale=1；过期快照：*stale=1 且 age_ms 为实际年龄。
+ * @param age_ms 可为 NULL；有效快照时为距上次刷新的毫秒数，冷启动为 -1
+ * @param stale 可为 NULL；1=冷启动或 TTL 过期，0=新鲜
+ */
+void ofono_get_egress_cache_meta(int *age_ms, int *stale);
+
+/**
  * 启动出口探测共享缓存 worker（锁外 ping；TTL 刷新）
  * @return 成功 0，创建线程失败 -1
  */

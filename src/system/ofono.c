@@ -1815,14 +1815,20 @@ static int ofono_egress_reachable(void) {
   return snap.ipv4.success ? 1 : 0;
 }
 
-int ofono_probe_connectivity(OfonoConnectivityProbe *out) {
+int ofono_probe_connectivity_ex(OfonoConnectivityProbe *out, int *age_ms,
+                                int *stale) {
+  int age = -1;
+  int is_stale = 1;
+
   if (!out)
     return -1;
 
   pthread_mutex_lock(&g_egress_cache_mutex);
   if (g_egress_valid) {
     *out = g_egress_snap;
-    if (egress_ttl_expired_locked())
+    age = egress_age_ms_locked();
+    is_stale = egress_ttl_expired_locked() ? 1 : 0;
+    if (is_stale)
       egress_probe_kick_locked();
   } else {
     memset(out, 0, sizeof(*out));
@@ -1835,7 +1841,33 @@ int ofono_probe_connectivity(OfonoConnectivityProbe *out) {
     egress_probe_kick_locked();
   }
   pthread_mutex_unlock(&g_egress_cache_mutex);
+
+  if (age_ms)
+    *age_ms = age;
+  if (stale)
+    *stale = is_stale;
   return 0;
+}
+
+int ofono_probe_connectivity(OfonoConnectivityProbe *out) {
+  return ofono_probe_connectivity_ex(out, NULL, NULL);
+}
+
+void ofono_get_egress_cache_meta(int *age_ms, int *stale) {
+  int age = -1;
+  int is_stale = 1;
+
+  pthread_mutex_lock(&g_egress_cache_mutex);
+  if (g_egress_valid) {
+    age = egress_age_ms_locked();
+    is_stale = egress_ttl_expired_locked() ? 1 : 0;
+  }
+  pthread_mutex_unlock(&g_egress_cache_mutex);
+
+  if (age_ms)
+    *age_ms = age;
+  if (stale)
+    *stale = is_stale;
 }
 
 int ofono_egress_reachable_fresh(int timeout_ms) {

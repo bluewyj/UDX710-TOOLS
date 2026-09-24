@@ -114,6 +114,11 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "警告: 数据连接 Watchdog 启动失败\n");
   }
 
+  /* 出口探测共享缓存 worker（TTL 刷新；HTTP/普通 egress 只读快照） */
+  if (ofono_start_egress_probe_cache() != 0) {
+    fprintf(stderr, "警告: egress probe cache 启动失败\n");
+  }
+
   /* 首启幂等写入 platform USB/APN 配置文件 */
   if (platform_setup_ensure() != 0) {
     fprintf(stderr, "警告: platform_setup_ensure 失败\n");
@@ -135,6 +140,7 @@ int main(int argc, char *argv[]) {
   /* 启动 HTTP 服务器 */
   if (http_server_start(port) != 0) {
     fprintf(stderr, "服务器启动失败\n");
+    ofono_stop_egress_probe_cache();
     ofono_stop_data_watchdog();
     ofono_stop_data_monitor();
     ofono_deinit();
@@ -146,6 +152,7 @@ int main(int argc, char *argv[]) {
 
   /* 清理 */
   http_server_stop();
+  ofono_stop_egress_probe_cache();
   ofono_stop_data_watchdog();
   ofono_stop_data_monitor();
   ofono_deinit();

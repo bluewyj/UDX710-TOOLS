@@ -1101,7 +1101,10 @@ void handle_connectivity(struct mg_connection *c, struct mg_http_message *hm) {
   HTTP_CHECK_GET(c, hm);
 
   OfonoConnectivityProbe probe;
-  if (ofono_probe_connectivity(&probe) != 0) {
+  int age_ms = -1;
+  int stale = 1;
+
+  if (ofono_probe_connectivity_ex(&probe, &age_ms, &stale) != 0) {
     HTTP_ERROR(c, 500, "connectivity probe failed");
     return;
   }
@@ -1128,6 +1131,9 @@ void handle_connectivity(struct mg_connection *c, struct mg_http_message *hm) {
   else if (probe.ipv6.error[0])
     json_add_str(j, "error", probe.ipv6.error);
   json_obj_close(j);
+
+  json_add_int(j, "age_ms", age_ms);
+  json_add_bool(j, "stale", stale);
 
   json_obj_close(j); /* data */
   json_obj_close(j); /* root */
