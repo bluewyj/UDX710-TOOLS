@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <glib.h>
 #include "mongoose.h"
@@ -89,6 +90,60 @@ static void parse_bands_info(const char *output4G, const char *output5G, int *ba
     }
 }
 
+#define BAND_CAPABILITY_TTL_S 60
+
+typedef struct {
+    int known;          /* 1=上次探测成功 */
+    time_t fetched_at;
+    int supported[16];  /* 与 band_map 下标对齐 */
+} BandCapabilityCache;
+
+static BandCapabilityCache g_band_cap = {0};
+
+/* force!=0 忽略 TTL；返回 1=已知，0=未知（此时 supported_out 全 1） */
+static int band_capability_get(int force, int supported_out[16]) {
+    time_t now = time(NULL);
+    int i;
+
+    if (!force && g_band_cap.known && g_band_cap.fetched_at > 0 &&
+        (now - g_band_cap.fetched_at) < BAND_CAPABILITY_TTL_S) {
+        memcpy(supported_out, g_band_cap.supported, sizeof(g_band_cap.supported));
+        return 1;
+    }
+
+    char *lte = NULL, *nr = NULL;
+    int ok_lte = 0, ok_nr = 0;
+    int caps[16];
+
+    memset(caps, 0, sizeof(caps));
+
+    if (execute_at("AT+SPLBAND=5", &lte) == 0 && lte && strstr(lte, "+SPLBAND:")) {
+        ok_lte = 1;
+    }
+    if (execute_at("AT+SPLBAND=4", &nr) == 0 && nr && strstr(nr, "+SPLBAND:")) {
+        ok_nr = 1;
+    }
+
+    if (ok_lte && ok_nr) {
+        parse_bands_info(lte, nr, caps);
+        memcpy(g_band_cap.supported, caps, sizeof(caps));
+        g_band_cap.known = 1;
+        g_band_cap.fetched_at = now;
+        memcpy(supported_out, caps, sizeof(caps));
+        if (lte) g_free(lte);
+        if (nr) g_free(nr);
+        return 1;
+    }
+
+    /* 部分/全部失败 → 整次未知；缓存记为未知 */
+    g_band_cap.known = 0;
+    g_band_cap.fetched_at = now;
+    for (i = 0; i < 16; i++) supported_out[i] = 1;
+    if (lte) g_free(lte);
+    if (nr) g_free(nr);
+    return 0;
+}
+
 /* GET /api/bands - 获取频段状态 */
 void handle_get_bands(struct mg_connection *c, struct mg_http_message *hm) {
     HTTP_CHECK_GET(c, hm);
@@ -113,37 +168,43 @@ void handle_get_bands(struct mg_connection *c, struct mg_http_message *hm) {
     if (result4G) g_free(result4G);
     if (result5G) g_free(result5G);
 
+    int supported[16];
+    int cap_known = band_capability_get(0, supported);
+    /* cap_known==0 时 supported 已全 1 */
+
     /* 使用JSON Builder构建响应 */
     JsonBuilder *j = json_new();
     json_obj_open(j);
     
     /* 4G TDD */
     json_arr_open(j, "4G_TDD");
-    json_arr_obj_open(j); json_add_str(j, "name", "TDD_34"); json_add_str(j, "label", "B34"); json_add_bool(j, "locked", bands[0]); json_obj_close(j);
-    json_arr_obj_open(j); json_add_str(j, "name", "TDD_38"); json_add_str(j, "label", "B38"); json_add_bool(j, "locked", bands[1]); json_obj_close(j);
-    json_arr_obj_open(j); json_add_str(j, "name", "TDD_39"); json_add_str(j, "label", "B39"); json_add_bool(j, "locked", bands[2]); json_obj_close(j);
-    json_arr_obj_open(j); json_add_str(j, "name", "TDD_40"); json_add_str(j, "label", "B40"); json_add_bool(j, "locked", bands[3]); json_obj_close(j);
-    json_arr_obj_open(j); json_add_str(j, "name", "TDD_41"); json_add_str(j, "label", "B41"); json_add_bool(j, "locked", bands[4]); json_obj_close(j);
+    json_arr_obj_open(j); json_add_str(j, "name", "TDD_34"); json_add_str(j, "label", "B34"); json_add_bool(j, "locked", bands[0]); json_add_bool(j, "supported", supported[0]); json_obj_close(j);
+    json_arr_obj_open(j); json_add_str(j, "name", "TDD_38"); json_add_str(j, "label", "B38"); json_add_bool(j, "locked", bands[1]); json_add_bool(j, "supported", supported[1]); json_obj_close(j);
+    json_arr_obj_open(j); json_add_str(j, "name", "TDD_39"); json_add_str(j, "label", "B39"); json_add_bool(j, "locked", bands[2]); json_add_bool(j, "supported", supported[2]); json_obj_close(j);
+    json_arr_obj_open(j); json_add_str(j, "name", "TDD_40"); json_add_str(j, "label", "B40"); json_add_bool(j, "locked", bands[3]); json_add_bool(j, "supported", supported[3]); json_obj_close(j);
+    json_arr_obj_open(j); json_add_str(j, "name", "TDD_41"); json_add_str(j, "label", "B41"); json_add_bool(j, "locked", bands[4]); json_add_bool(j, "supported", supported[4]); json_obj_close(j);
     json_arr_close(j);
     
     /* 4G FDD */
     json_arr_open(j, "4G_FDD");
-    json_arr_obj_open(j); json_add_str(j, "name", "FDD_01"); json_add_str(j, "label", "B1"); json_add_bool(j, "locked", bands[5]); json_obj_close(j);
-    json_arr_obj_open(j); json_add_str(j, "name", "FDD_03"); json_add_str(j, "label", "B3"); json_add_bool(j, "locked", bands[6]); json_obj_close(j);
-    json_arr_obj_open(j); json_add_str(j, "name", "FDD_05"); json_add_str(j, "label", "B5"); json_add_bool(j, "locked", bands[7]); json_obj_close(j);
-    json_arr_obj_open(j); json_add_str(j, "name", "FDD_08"); json_add_str(j, "label", "B8"); json_add_bool(j, "locked", bands[8]); json_obj_close(j);
+    json_arr_obj_open(j); json_add_str(j, "name", "FDD_01"); json_add_str(j, "label", "B1"); json_add_bool(j, "locked", bands[5]); json_add_bool(j, "supported", supported[5]); json_obj_close(j);
+    json_arr_obj_open(j); json_add_str(j, "name", "FDD_03"); json_add_str(j, "label", "B3"); json_add_bool(j, "locked", bands[6]); json_add_bool(j, "supported", supported[6]); json_obj_close(j);
+    json_arr_obj_open(j); json_add_str(j, "name", "FDD_05"); json_add_str(j, "label", "B5"); json_add_bool(j, "locked", bands[7]); json_add_bool(j, "supported", supported[7]); json_obj_close(j);
+    json_arr_obj_open(j); json_add_str(j, "name", "FDD_08"); json_add_str(j, "label", "B8"); json_add_bool(j, "locked", bands[8]); json_add_bool(j, "supported", supported[8]); json_obj_close(j);
     json_arr_close(j);
     
     /* 5G */
     json_arr_open(j, "5G");
-    json_arr_obj_open(j); json_add_str(j, "name", "N01"); json_add_str(j, "label", "N1"); json_add_bool(j, "locked", bands[9]); json_obj_close(j);
-    json_arr_obj_open(j); json_add_str(j, "name", "N08"); json_add_str(j, "label", "N8"); json_add_bool(j, "locked", bands[10]); json_obj_close(j);
-    json_arr_obj_open(j); json_add_str(j, "name", "N28"); json_add_str(j, "label", "N28"); json_add_bool(j, "locked", bands[11]); json_obj_close(j);
-    json_arr_obj_open(j); json_add_str(j, "name", "N41"); json_add_str(j, "label", "N41"); json_add_bool(j, "locked", bands[12]); json_obj_close(j);
-    json_arr_obj_open(j); json_add_str(j, "name", "N77"); json_add_str(j, "label", "N77"); json_add_bool(j, "locked", bands[13]); json_obj_close(j);
-    json_arr_obj_open(j); json_add_str(j, "name", "N78"); json_add_str(j, "label", "N78"); json_add_bool(j, "locked", bands[14]); json_obj_close(j);
-    json_arr_obj_open(j); json_add_str(j, "name", "N79"); json_add_str(j, "label", "N79"); json_add_bool(j, "locked", bands[15]); json_obj_close(j);
+    json_arr_obj_open(j); json_add_str(j, "name", "N01"); json_add_str(j, "label", "N1"); json_add_bool(j, "locked", bands[9]); json_add_bool(j, "supported", supported[9]); json_obj_close(j);
+    json_arr_obj_open(j); json_add_str(j, "name", "N08"); json_add_str(j, "label", "N8"); json_add_bool(j, "locked", bands[10]); json_add_bool(j, "supported", supported[10]); json_obj_close(j);
+    json_arr_obj_open(j); json_add_str(j, "name", "N28"); json_add_str(j, "label", "N28"); json_add_bool(j, "locked", bands[11]); json_add_bool(j, "supported", supported[11]); json_obj_close(j);
+    json_arr_obj_open(j); json_add_str(j, "name", "N41"); json_add_str(j, "label", "N41"); json_add_bool(j, "locked", bands[12]); json_add_bool(j, "supported", supported[12]); json_obj_close(j);
+    json_arr_obj_open(j); json_add_str(j, "name", "N77"); json_add_str(j, "label", "N77"); json_add_bool(j, "locked", bands[13]); json_add_bool(j, "supported", supported[13]); json_obj_close(j);
+    json_arr_obj_open(j); json_add_str(j, "name", "N78"); json_add_str(j, "label", "N78"); json_add_bool(j, "locked", bands[14]); json_add_bool(j, "supported", supported[14]); json_obj_close(j);
+    json_arr_obj_open(j); json_add_str(j, "name", "N79"); json_add_str(j, "label", "N79"); json_add_bool(j, "locked", bands[15]); json_add_bool(j, "supported", supported[15]); json_obj_close(j);
     json_arr_close(j);
+
+    json_add_bool(j, "capability_unknown", cap_known ? 0 : 1);
     
     json_obj_close(j);
     HTTP_OK_FREE(c, json_finish(j));
@@ -214,6 +275,39 @@ void handle_lock_bands(struct mg_connection *c, struct mg_http_message *hm) {
     }
 
     printf("计算结果: 4G TDD=%d, 4G FDD=%d, 5G FDD=%d, 5G TDD=%d\n", tdd4G, fdd4G, fdd5G, tdd5G);
+
+    int supported[16];
+    int cap_known = band_capability_get(1, supported);
+    if (cap_known) {
+        char rejected[256];
+        size_t rj = 0;
+        rejected[0] = '\0';
+        for (int i = 0; i < band_count; i++) {
+            const BandMapping *bm = find_band(bands[i]);
+            if (!bm) continue;
+            int idx = (int)(bm - band_map); /* band_map 为静态数组，指针差即下标 */
+            if (idx < 0 || idx >= 16) continue;
+            if (!supported[idx]) {
+                if (rj > 0 && rj + 1 < sizeof(rejected)) {
+                    rejected[rj++] = ',';
+                    rejected[rj] = '\0';
+                }
+                size_t nlen = strlen(bands[i]);
+                if (rj + nlen + 1 < sizeof(rejected)) {
+                    memcpy(rejected + rj, bands[i], nlen);
+                    rj += nlen;
+                    rejected[rj] = '\0';
+                }
+            }
+        }
+        if (rejected[0] != '\0') {
+            char err[320];
+            snprintf(err, sizeof(err), "unsupported bands: %s", rejected);
+            HTTP_ERROR(c, 400, err);
+            return;
+        }
+    }
+    /* cap_known==0：失败开放，继续既有锁序列 */
 
     char *result = NULL;
     char cmd[128];
