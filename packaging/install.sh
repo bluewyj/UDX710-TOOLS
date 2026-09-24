@@ -68,6 +68,13 @@ dbg() {
     # #endregion
   fi
 
+  # Soft reboot = fake unplug (unbind UDC before reboot)
+  if [ -f "$DIR/soft-reboot-safe.sh" ]; then
+    cp -f "$DIR/soft-reboot-safe.sh" "$ROOT/soft-reboot-safe.sh"
+    chmod 755 "$ROOT/soft-reboot-safe.sh"
+    echo "installed soft-reboot-safe.sh"
+  fi
+
   # stop old server (do not kill adbd)
   if [ -f /tmp/6677-server.pid ]; then
     kill "$(cat /tmp/6677-server.pid)" 2>/dev/null || true

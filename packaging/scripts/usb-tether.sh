@@ -576,6 +576,15 @@ pc_phantom_tick() {
 # Physical unplug/replug already re-enumerates — UDC here breaks Windows "Identifying" (H11).
 # Marker /mnt/data/need-usb-renum is set by crontab / device_reboot before reboot.
 warm_reboot_usb_recover() {
+    # Clean soft-reboot (UDC unbound before reboot) leaves no dirty marker —
+    # treat like physical plug: do NOT thrash UDC (H11 / ImmortalWrt).
+    if [ -f /mnt/data/usb-clean-reboot ]; then
+        rm -f /mnt/data/usb-clean-reboot
+        log_msg "clean soft-reboot: skip udc (host already saw disconnect)"
+        sleep 2
+        spawn_usb_share_at boot-clean-reboot
+        return 0
+    fi
     if [ ! -f /mnt/data/need-usb-renum ]; then
         # #region agent log
         log_msg "skip udc reset: physical plug or loader restart (H11)"
@@ -590,7 +599,7 @@ warm_reboot_usb_recover() {
     # #endregion
     [ -x /home/root/fix-rndis-link.sh ] && /home/root/fix-rndis-link.sh >> "$LOG" 2>&1
 
-    # ImmortalWrt hosts often need 2–3 UDC cycles after soft reboot (TX watchdog).
+    # ImmortalWrt hosts often need 2–3 UDC cycles after dirty soft reboot (TX watchdog).
     _try=0
     while [ "$_try" -lt 3 ]; do
         _try=$((_try + 1))

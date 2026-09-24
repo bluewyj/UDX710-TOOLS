@@ -83,13 +83,22 @@ int run_command_timeout(int timeout_sec, char *output, size_t size, const char *
 }
 
 void device_reboot(void) {
-    char buf[256];
-    /* Soft reboot (cable stays): H9 marker so usb-tether does UDC re-enum.
-     * Extra sync + short delay: ImmortalWrt RNDIS hosts often sleep-die if
-     * reboot races mid-USB-TX. Prefer avoid reboot after OTA when possible.
+    char buf[512];
+    /*
+     * ImmortalWrt RNDIS sleep-death: soft reboot with cable in leaves host
+     * rndis_host TX-watchdog; static 66.x cannot ARP. Simulate unplug first:
+     * unbind UDC → host disconnect → reboot → fresh enum on boot.
+     * Prefer /home/root/soft-reboot-safe.sh when installed by OTA.
      */
     run_command(buf, sizeof(buf), "sh", "-c",
-                "touch /mnt/data/need-usb-renum; sync; sleep 1; sync; reboot",
+                "if [ -x /home/root/soft-reboot-safe.sh ]; then "
+                "  exec /home/root/soft-reboot-safe.sh; "
+                "fi; "
+                "echo none > /sys/kernel/config/usb_gadget/g1/UDC 2>/dev/null; "
+                "sleep 2; "
+                "rm -f /mnt/data/need-usb-renum; "
+                "touch /mnt/data/usb-clean-reboot 2>/dev/null; "
+                "sync; sleep 1; sync; reboot",
                 NULL);
 }
 

@@ -87,11 +87,15 @@ jobs:
             cp packaging/scripts/usb-tether.sh output/usb-tether.sh
             chmod 755 output/usb-tether.sh
           fi
+          if [ -f packaging/scripts/soft-reboot-safe.sh ]; then
+            cp packaging/scripts/soft-reboot-safe.sh output/soft-reboot-safe.sh
+            chmod 755 output/soft-reboot-safe.sh
+          fi
           cp packaging/install.sh output/install.sh
           chmod 755 output/install.sh
           file output/6677/server
           ls -la output/6677/server output/install.sh
-          ls -la output/apn-apply-now.sh output/usb-tether.sh 2>/dev/null || true
+          ls -la output/apn-apply-now.sh output/usb-tether.sh output/soft-reboot-safe.sh 2>/dev/null || true
           head -n 20 output/6677/start.sh
 
       - name: Upload artifact
