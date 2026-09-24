@@ -20,7 +20,7 @@ const char* update_get_version(void) {
 
 /* 从URL下载更新包 */
 int update_download(const char *url) {
-    char output[1024];
+    char output[2048];
     
     if (!url || strlen(url) == 0) {
         return -1;
@@ -29,11 +29,16 @@ int update_download(const char *url) {
     /* 清理旧文件 */
     update_cleanup();
     
-    /* 优先使用curl（更常见），失败再用wget */
-    int ret = run_command(output, sizeof(output), "curl", "-k", "-s", "-L", "-o", UPDATE_ZIP_PATH, url, NULL);
+    /* 优先使用curl（更常见），失败再用wget；保留错误输出便于排查 */
+    int ret = run_command(output, sizeof(output), "curl", "-k", "-sS", "-L",
+                          "--connect-timeout", "15", "--max-time", "120",
+                          "-o", UPDATE_ZIP_PATH, url, NULL);
     if (ret != 0) {
-        ret = run_command(output, sizeof(output), "wget", "--no-check-certificate", "-q", "-O", UPDATE_ZIP_PATH, url, NULL);
+        printf("[OTA] curl download failed: %s\n", output);
+        ret = run_command(output, sizeof(output), "wget", "--no-check-certificate",
+                          "-T", "30", "-q", "-O", UPDATE_ZIP_PATH, url, NULL);
         if (ret != 0) {
+            printf("[OTA] wget download failed: %s\n", output);
             return -1;
         }
     }
@@ -41,8 +46,10 @@ int update_download(const char *url) {
     /* 检查文件是否存在 */
     struct stat st;
     if (stat(UPDATE_ZIP_PATH, &st) != 0 || st.st_size == 0) {
+        printf("[OTA] download empty or missing\n");
         return -1;
     }
+    printf("[OTA] downloaded %ld bytes from %s\n", (long)st.st_size, url);
     
     return 0;
 }
@@ -77,6 +84,8 @@ int update_extract(void) {
 /* 执行安装脚本 */
 int update_install(char *output, size_t size) {
     struct stat st;
+    char cmd[512];
+    char cmd_out[2048];
     
     /* 检查安装脚本是否存在 */
     if (stat(UPDATE_INSTALL_SCRIPT, &st) != 0) {
@@ -85,13 +94,22 @@ int update_install(char *output, size_t size) {
     }
     
     /* 添加执行权限 */
-    run_command(output, size, "chmod", "+x", UPDATE_INSTALL_SCRIPT, NULL);
+    run_command(cmd_out, sizeof(cmd_out), "chmod", "+x", UPDATE_INSTALL_SCRIPT, NULL);
+
+    /*
+     * Critical: install.sh uses paths relative to the package root.
+     * run_command("sh", "/tmp/update/install.sh") keeps cwd elsewhere, so
+     * relative 6677/server is not found and OTA appears to "install" nothing.
+     * Force cwd to UPDATE_EXTRACT_DIR via sh -c.
+     */
+    snprintf(cmd, sizeof(cmd),
+             "cd '%s' && /bin/sh '%s'", UPDATE_EXTRACT_DIR, UPDATE_INSTALL_SCRIPT);
     
-    /* 执行安装脚本 */
-    if (run_command(output, size, "sh", UPDATE_INSTALL_SCRIPT, NULL) != 0) {
+    if (run_command(cmd_out, sizeof(cmd_out), "sh", "-c", cmd, NULL) != 0) {
+        snprintf(output, size, "install failed: %s", cmd_out);
         return -1;
     }
-    
+    snprintf(output, size, "%s", cmd_out);
     return 0;
 }
 
