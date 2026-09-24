@@ -10,6 +10,14 @@
 extern "C" {
 #endif
 
+#define MAX_THERMAL_ZONES 16
+
+typedef struct {
+    char zone[32];
+    char type[64];
+    double temperature;           /* Celsius */
+} ThermalZoneInfo;
+
 /* 系统信息结构 */
 typedef struct {
     char hostname[64];
@@ -25,7 +33,9 @@ typedef struct {
     char bridge_status[32];
     char sim_slot[16];
     char signal_strength[64];
-    double thermal_temp;          /* Celsius */
+    double thermal_temp;          /* Celsius (mean of readable zones, or -1) */
+    ThermalZoneInfo thermal_zones[MAX_THERMAL_ZONES];
+    int thermal_zone_count;
     char power_status[32];
     char battery_health[32];
     unsigned int battery_capacity;

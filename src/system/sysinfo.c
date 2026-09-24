@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <sys/utsname.h>
 #include <glib.h>
 #include "sysinfo.h"
@@ -119,16 +120,58 @@ int get_signal_strength(char *strength, size_t size) {
     return 0;
 }
 
-double get_thermal_temp(void) {
-    char output[64];
-    if (run_command(output, sizeof(output), "sh", "-c",
-        "cat /sys/class/thermal/thermal_zone*/temp | awk '{sum+=$1} END {printf \"%.2f\", sum/NR/1000}'",
-        NULL) != 0) {
-        return -1;
+static void populate_thermal_info(SystemInfo *info) {
+    info->thermal_zone_count = 0;
+    info->thermal_temp = -1;
+
+    DIR *dir = opendir("/sys/class/thermal");
+    if (!dir) return;
+
+    struct dirent *ent;
+    double sum = 0;
+    int readable = 0;
+
+    while ((ent = readdir(dir)) != NULL) {
+        if (strncmp(ent->d_name, "thermal_zone", 12) != 0)
+            continue;
+        if (info->thermal_zone_count >= MAX_THERMAL_ZONES)
+            break;
+
+        char path[256];
+        char buf[128];
+        ThermalZoneInfo *z = &info->thermal_zones[info->thermal_zone_count];
+
+        snprintf(path, sizeof(path), "/sys/class/thermal/%s/type", ent->d_name);
+        if (read_file(path, buf, sizeof(buf)) != 0)
+            continue;
+        buf[strcspn(buf, "\n")] = '\0';
+        strncpy(z->zone, ent->d_name, sizeof(z->zone) - 1);
+        z->zone[sizeof(z->zone) - 1] = '\0';
+        strncpy(z->type, buf, sizeof(z->type) - 1);
+        z->type[sizeof(z->type) - 1] = '\0';
+
+        snprintf(path, sizeof(path), "/sys/class/thermal/%s/temp", ent->d_name);
+        if (read_file(path, buf, sizeof(buf)) != 0)
+            continue;
+        long temp_milli = atol(buf);
+        z->temperature = temp_milli / 1000.0;
+
+        sum += z->temperature;
+        readable++;
+        info->thermal_zone_count++;
     }
-    double temp;
-    if (sscanf(output, "%lf", &temp) == 1) return temp;
-    return -1;
+
+    closedir(dir);
+
+    if (readable > 0)
+        info->thermal_temp = sum / readable;
+}
+
+double get_thermal_temp(void) {
+    SystemInfo info;
+    memset(&info, 0, sizeof(info));
+    populate_thermal_info(&info);
+    return info.thermal_temp;
 }
 
 
@@ -190,8 +233,8 @@ int get_system_info(SystemInfo *info) {
     /* 信号强度 */
     get_signal_strength(info->signal_strength, sizeof(info->signal_strength));
 
-    /* 温度 */
-    info->thermal_temp = get_thermal_temp();
+    /* 温度与 thermal zone 列表 */
+    populate_thermal_info(info);
 
     /* 电源状态 */
     if (read_file("/sys/class/power_supply/battery/status", buf, sizeof(buf)) == 0) {

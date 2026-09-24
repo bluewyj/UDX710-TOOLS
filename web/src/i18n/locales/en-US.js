@@ -101,6 +101,8 @@ export default {
     architecture: 'Architecture',
     uptime: 'Uptime',
     temperature: 'Temperature',
+    thermalZones: 'Thermal Zones',
+    noThermalData: 'No thermal data available',
     memoryUsage: 'Memory Usage',
     clearCache: 'Clear Cache',
     clearing: 'Clearing',
