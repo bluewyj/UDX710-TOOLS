@@ -260,6 +260,8 @@
     connectionStatus: '连接状态',
     active: '已激活',
     inactive: '未激活',
+    guidanceNotApplied: '当前模板尚未应用到网卡。请保存/应用后再查看连接状态。',
+    guidanceAppliedInactive: '配置已写入网卡，但数据连接未激活。认卡/驻网成功仍可能未开数据——请到「网络」页打开移动数据，或稍候等待拨号。',
     lastTemplateHint: '这是最后一个模板且正在使用中，需要先切换到自动模式才能删除。是否自动切换？',
     activeTemplateHint: '该模板正在使用中，需要先切换到自动模式才能删除。是否自动切换？',
     switchedToAuto: '已切换到自动模式并删除模板',
