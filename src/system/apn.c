@@ -8,9 +8,11 @@
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
+#include <unistd.h>
 #include "apn.h"
 #include "database.h"
 #include "ofono.h"
+#include "exec_utils.h"
 
 /* APN模块专用互斥锁 */
 static pthread_mutex_t g_apn_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -88,12 +90,27 @@ static int load_apn_config(void) {
  * 应用APN模板到oFono
  */
 static int apply_apn_to_ofono(const ApnTemplate *tpl) {
+    char out[512];
+
     if (!tpl) {
         printf("[APN] 模板参数无效\n");
         return -1;
     }
     
     printf("[APN] 开始应用模板: %s (APN: %s)\n", tpl->name, tpl->apn);
+
+    /* Prefer on-device helper so apply works even before ofono-server rebuild. */
+    if (access("/home/root/apn-apply-now.sh", X_OK) == 0) {
+        printf("[APN] apply via apn-apply-now.sh\n");
+        if (run_command(out, sizeof(out), "/home/root/apn-apply-now.sh", tpl->apn,
+                        tpl->auth_method[0] ? tpl->auth_method : "none",
+                        tpl->username, tpl->password,
+                        tpl->protocol[0] ? tpl->protocol : "dual", NULL) == 0) {
+            printf("[APN] APN配置应用成功 (apply-now)\n");
+            return 0;
+        }
+        printf("[APN] apply-now failed, fallback ofono dbus\n");
+    }
     
     /* 检查oFono是否已初始化，如果未初始化则尝试初始化 */
     if (!ofono_is_initialized()) {
@@ -580,6 +597,7 @@ int apn_apply_template(int template_id) {
  * 清除所有APN配置（自动模式使用）
  */
 int apn_clear_all(void) {
+    char out[512];
     printf("[APN] 清除所有APN配置\n");
     
     /* 重置数据库配置为自动模式 */
@@ -600,6 +618,16 @@ int apn_clear_all(void) {
     g_current_config.template_id = 0;
     g_current_config.auto_start = 0;
     
+    /* Prefer helper: clear persist + cellular bounce (plain SetProperty hits InUse). */
+    if (access("/home/root/apn-apply-now.sh", X_OK) == 0) {
+        if (run_command(out, sizeof(out), "/home/root/apn-apply-now.sh", "--clear",
+                        NULL) == 0) {
+            printf("[APN] APN配置清除完成 (apply-now --clear)\n");
+            return 0;
+        }
+        printf("[APN] apply-now --clear failed, fallback ofono clear\n");
+    }
+
     /* 清除oFono APN配置 */
     if (ofono_is_initialized()) {
         ApnContext contexts[MAX_APN_CONTEXTS];
@@ -607,14 +635,13 @@ int apn_clear_all(void) {
         
         for (int i = 0; i < count; i++) {
             if (strcmp(contexts[i].context_type, "internet") == 0) {
-                /* 重置为空配置 */
                 ofono_set_apn_properties(
                     contexts[i].path,
                     "",      /* 清空APN */
-                    "dual",  /* 默认协议 */
-                    NULL,    /* 清空用户名 */
-                    NULL,    /* 清空密码 */
-                    "chap"   /* 默认认证 */
+                    "dual",
+                    NULL,
+                    NULL,
+                    "chap"
                 );
                 printf("[APN] 已清除 %s 的APN配置\n", contexts[i].path);
             }

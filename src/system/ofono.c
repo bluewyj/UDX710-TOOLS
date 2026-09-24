@@ -11,11 +11,14 @@
 #include "ofono.h"
 #include "dbus_core.h"
 #include "sysinfo.h"
+#include "exec_utils.h"
+#include <dirent.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1128,57 +1131,276 @@ int ofono_set_apn_property(const char *context_path, const char *property,
   return 0;
 }
 
-int ofono_set_apn_properties(const char *context_path, const char *apn,
-                             const char *protocol, const char *username,
-                             const char *password, const char *auth_method) {
-  GError *error = NULL;
-  GVariant *result = NULL;
-  GDBusProxy *proxy = NULL;
-  int was_active = 0;
+/* Write ofono user APN persist so reload/activate keeps the value.
+ * Unisoc ofono reloads from /mnt/data/ofono/<IMSI>/{defult_apn,gprs}. */
+static int ofono_write_apn_persist(const char *apn, const char *protocol,
+                                   const char *username, const char *password,
+                                   const char *auth_method) {
+  DIR *dir;
+  struct dirent *ent;
+  char imsi[32] = {0};
+  char path[256];
+  FILE *fp;
+  char buf[512];
+  const char *auth = auth_method && auth_method[0] ? auth_method : "none";
+  const char *proto = protocol && protocol[0] ? protocol : "dual";
+  const char *user = username ? username : "";
+  const char *pass = password ? password : "";
 
-  if (!context_path || !ensure_connection()) {
+  dir = opendir("/mnt/data/ofono");
+  if (!dir) {
     return -1;
   }
-
-  /* 1. 检查 context 是否激活 */
-  proxy = g_dbus_proxy_new_sync(g_dbus_conn, G_DBUS_PROXY_FLAGS_NONE, NULL,
-                                OFONO_SERVICE, context_path,
-                                OFONO_CONNECTION_CONTEXT, NULL, &error);
-
-  if (!proxy) {
-    if (error)
-      g_error_free(error);
+  while ((ent = readdir(dir)) != NULL) {
+    size_t n = strlen(ent->d_name);
+    int ok = (n == 15);
+    size_t i;
+    for (i = 0; ok && i < n; i++) {
+      if (ent->d_name[i] < '0' || ent->d_name[i] > '9') {
+        ok = 0;
+      }
+    }
+    if (ok) {
+      strncpy(imsi, ent->d_name, sizeof(imsi) - 1);
+      break;
+    }
+  }
+  closedir(dir);
+  if (!imsi[0]) {
     return -2;
   }
 
+  snprintf(path, sizeof(path), "/mnt/data/ofono/%s", imsi);
+  mkdir(path, 0755);
+
+  snprintf(path, sizeof(path), "/mnt/data/ofono/%s/defult_apn", imsi);
+  if (!apn || !apn[0]) {
+    unlink(path);
+  } else {
+    fp = fopen(path, "w");
+    if (!fp) {
+      return -3;
+    }
+    fprintf(fp,
+            "[userDefultApn]\nAccessPointName=%s\nUsername=%s\nPassword=%s\n"
+            "AuthenticationMethod=%s\nProtocol=%s\n",
+            apn, user, pass, auth, proto);
+    fclose(fp);
+  }
+
+  snprintf(path, sizeof(path), "/mnt/data/ofono/%s/gprs", imsi);
+  fp = fopen(path, "r");
+  if (fp) {
+    char out_path[280];
+    FILE *out;
+    snprintf(out_path, sizeof(out_path), "%s.tmp", path);
+    out = fopen(out_path, "w");
+    if (out) {
+      int saw_apn = 0;
+      while (fgets(buf, sizeof(buf), fp)) {
+        if (strncmp(buf, "AccessPointName=", 16) == 0) {
+          fprintf(out, "AccessPointName=%s\n", apn ? apn : "");
+          saw_apn = 1;
+        } else if (auth_method && strncmp(buf, "AuthenticationMethod=", 21) == 0) {
+          fprintf(out, "AuthenticationMethod=%s\n", auth);
+        } else {
+          fputs(buf, out);
+        }
+      }
+      if (!saw_apn && apn && apn[0]) {
+        fprintf(out, "AccessPointName=%s\n", apn);
+      }
+      fclose(out);
+      fclose(fp);
+      rename(out_path, path);
+    } else {
+      fclose(fp);
+    }
+  }
+
+  sync();
+  printf("[APN] persist written imsi=%s apn=%s\n", imsi, apn ? apn : "(clear)");
+  return 0;
+}
+
+static int ofono_context_is_active(const char *context_path) {
+  GError *error = NULL;
+  GVariant *result = NULL;
+  GDBusProxy *proxy = NULL;
+  int active = 0;
+
+  if (!context_path || !ensure_connection()) {
+    return 0;
+  }
+  proxy = g_dbus_proxy_new_sync(g_dbus_conn, G_DBUS_PROXY_FLAGS_NONE, NULL,
+                                OFONO_SERVICE, context_path,
+                                OFONO_CONNECTION_CONTEXT, NULL, &error);
+  if (!proxy) {
+    if (error)
+      g_error_free(error);
+    return 0;
+  }
   result = g_dbus_proxy_call_sync(proxy, "GetProperties", NULL,
                                   G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS,
                                   NULL, &error);
-
   if (result) {
     GVariant *props = g_variant_get_child_value(result, 0);
     GVariant *active_var =
         g_variant_lookup_value(props, "Active", G_VARIANT_TYPE_BOOLEAN);
     if (active_var) {
-      was_active = g_variant_get_boolean(active_var) ? 1 : 0;
+      active = g_variant_get_boolean(active_var) ? 1 : 0;
       g_variant_unref(active_var);
     }
     g_variant_unref(props);
     g_variant_unref(result);
-  } else {
-    if (error) {
+  } else if (error) {
+    g_error_free(error);
+  }
+  g_object_unref(proxy);
+  return active;
+}
+
+static int ofono_context_exists(const char *context_path) {
+  GError *error = NULL;
+  GVariant *result = NULL;
+  GDBusProxy *proxy = NULL;
+  int ok = 0;
+
+  if (!context_path || !ensure_connection()) {
+    return 0;
+  }
+  proxy = g_dbus_proxy_new_sync(g_dbus_conn, G_DBUS_PROXY_FLAGS_NONE, NULL,
+                                OFONO_SERVICE, context_path,
+                                OFONO_CONNECTION_CONTEXT, NULL, &error);
+  if (!proxy) {
+    if (error)
       g_error_free(error);
-      error = NULL;
+    return 0;
+  }
+  result = g_dbus_proxy_call_sync(proxy, "GetProperties", NULL,
+                                  G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS,
+                                  NULL, &error);
+  if (result) {
+    ok = 1;
+    g_variant_unref(result);
+  } else if (error) {
+    g_error_free(error);
+  }
+  g_object_unref(proxy);
+  return ok;
+}
+
+static int ofono_read_context_apn(const char *context_path, char *out,
+                                  size_t out_sz) {
+  GError *error = NULL;
+  GVariant *result = NULL;
+  GDBusProxy *proxy = NULL;
+  int ret = -1;
+
+  if (!context_path || !out || out_sz == 0 || !ensure_connection()) {
+    return -1;
+  }
+  out[0] = '\0';
+  proxy = g_dbus_proxy_new_sync(g_dbus_conn, G_DBUS_PROXY_FLAGS_NONE, NULL,
+                                OFONO_SERVICE, context_path,
+                                OFONO_CONNECTION_CONTEXT, NULL, &error);
+  if (!proxy) {
+    if (error)
+      g_error_free(error);
+    return -2;
+  }
+  result = g_dbus_proxy_call_sync(proxy, "GetProperties", NULL,
+                                  G_DBUS_CALL_FLAGS_NONE, OFONO_TIMEOUT_MS,
+                                  NULL, &error);
+  if (result) {
+    GVariant *props = g_variant_get_child_value(result, 0);
+    GVariant *apn_var =
+        g_variant_lookup_value(props, "AccessPointName", G_VARIANT_TYPE_STRING);
+    if (apn_var) {
+      const gchar *s = g_variant_get_string(apn_var, NULL);
+      if (s) {
+        strncpy(out, s, out_sz - 1);
+        out[out_sz - 1] = '\0';
+        ret = 0;
+      }
+      g_variant_unref(apn_var);
     }
+    g_variant_unref(props);
+    g_variant_unref(result);
+  } else if (error) {
+    g_error_free(error);
+  }
+  g_object_unref(proxy);
+  return ret;
+}
+
+int ofono_set_apn_properties(const char *context_path, const char *apn,
+                             const char *protocol, const char *username,
+                             const char *password, const char *auth_method) {
+  char out[512];
+  char got[128];
+  int n;
+  int set_rc;
+  struct stat st;
+
+  /* Prefer on-device helper: persist + cellular bounce (handles InUse). */
+  if (apn && apn[0] && stat("/home/root/apn-apply-now.sh", &st) == 0 &&
+      (st.st_mode & S_IXUSR)) {
+    printf("[APN] using apn-apply-now.sh for apn=%s\n", apn);
+    /* #region agent log */
+    {
+      FILE *dbg = fopen("/tmp/apn-apply-debug.ndjson", "a");
+      if (dbg) {
+        fprintf(dbg,
+                "{\"sessionId\":\"0c2eee\",\"hypothesisId\":\"H_script\","
+                "\"location\":\"ofono_set_apn_properties\",\"message\":\"delegate_script\","
+                "\"data\":{\"apn\":\"%s\"},\"timestamp\":%ld000}\n",
+                apn, (long)time(NULL));
+        fclose(dbg);
+      }
+    }
+    /* #endregion */
+    if (run_command(out, sizeof(out), "/home/root/apn-apply-now.sh", apn,
+                    auth_method ? auth_method : "none",
+                    username ? username : "", password ? password : "",
+                    protocol ? protocol : "dual", NULL) == 0) {
+      if (ofono_read_context_apn(context_path, got, sizeof(got)) == 0 &&
+          strcmp(got, apn) == 0) {
+        return 0;
+      }
+      /* Script may have succeeded after context path recycle */
+      sleep(2);
+      if (ofono_read_context_apn("/ril_0/context1", got, sizeof(got)) == 0 &&
+          strcmp(got, apn) == 0) {
+        return 0;
+      }
+    }
+    printf("[APN] apn-apply-now.sh failed or unverified, fallback C path\n");
   }
 
-  g_object_unref(proxy);
+  if (!context_path || !ensure_connection()) {
+    return -1;
+  }
 
-  /* 2. 如果激活中，先关闭 */
-  if (was_active) {
-    proxy = g_dbus_proxy_new_sync(g_dbus_conn, G_DBUS_PROXY_FLAGS_NONE, NULL,
-                                  OFONO_SERVICE, context_path,
-                                  OFONO_CONNECTION_CONTEXT, NULL, &error);
+  /* 1) Persist first — reactivation reloads from files. */
+  if (ofono_write_apn_persist(apn, protocol, username, password, auth_method) !=
+      0) {
+    printf("[APN] persist write failed (continuing dbus path)\n");
+  }
+
+  /* 2) Soft deactivate; if still active, disable cellular (connman holds PDP). */
+  run_command(out, sizeof(out), "sh", "-c",
+              "svc=$(connmanctl services 2>/dev/null | "
+              "grep -oE 'cellular_[^[:space:]]+_context1' | head -n1); "
+              "[ -n \"$svc\" ] && connmanctl disconnect \"$svc\"",
+              NULL);
+  if (ofono_context_exists(context_path) &&
+      ofono_context_is_active(context_path)) {
+    GError *error = NULL;
+    GVariant *result = NULL;
+    GDBusProxy *proxy = g_dbus_proxy_new_sync(
+        g_dbus_conn, G_DBUS_PROXY_FLAGS_NONE, NULL, OFONO_SERVICE, context_path,
+        OFONO_CONNECTION_CONTEXT, NULL, &error);
     if (proxy) {
       result = g_dbus_proxy_call_sync(
           proxy, "SetProperty",
@@ -1192,33 +1414,54 @@ int ofono_set_apn_properties(const char *context_path, const char *apn,
       }
       g_object_unref(proxy);
     }
-    /* 等待状态稳定 */
-    g_usleep(500000); /* 500ms */
+  }
+  for (n = 0; n < 10; n++) {
+    if (!ofono_context_exists(context_path) ||
+        !ofono_context_is_active(context_path)) {
+      break;
+    }
+    g_usleep(1000000);
+  }
+  if (ofono_context_exists(context_path) &&
+      ofono_context_is_active(context_path)) {
+    printf("[APN] soft deact failed, disable cellular\n");
+    run_command(out, sizeof(out), "connmanctl", "disable", "cellular", NULL);
+    sleep(3);
   }
 
-  /* 3. 设置各属性 */
-  if (apn) {
-    ofono_set_apn_property(context_path, "AccessPointName", apn);
-  }
-  if (protocol) {
-    ofono_set_apn_property(context_path, "Protocol", protocol);
-  }
-  if (username) {
-    ofono_set_apn_property(context_path, "Username", username);
-  }
-  if (password) {
-    ofono_set_apn_property(context_path, "Password", password);
-  }
-  if (auth_method) {
-    ofono_set_apn_property(context_path, "AuthenticationMethod", auth_method);
+  /* 3) Set properties only when inactive and context still present. */
+  if (apn && ofono_context_exists(context_path) &&
+      !ofono_context_is_active(context_path)) {
+    set_rc = ofono_set_apn_property(context_path, "AccessPointName", apn);
+    if (set_rc != 0) {
+      printf("[APN] SetProperty AccessPointName failed rc=%d\n", set_rc);
+    }
+    if (protocol) {
+      ofono_set_apn_property(context_path, "Protocol", protocol);
+    }
+    if (username) {
+      ofono_set_apn_property(context_path, "Username", username);
+    }
+    if (password) {
+      ofono_set_apn_property(context_path, "Password", password);
+    }
+    if (auth_method) {
+      ofono_set_apn_property(context_path, "AuthenticationMethod", auth_method);
+    }
   }
 
-  /* 4. 如果之前是激活状态，重新激活 */
-  if (was_active) {
-    g_usleep(500000); /* 500ms */
-    proxy = g_dbus_proxy_new_sync(g_dbus_conn, G_DBUS_PROXY_FLAGS_NONE, NULL,
-                                  OFONO_SERVICE, context_path,
-                                  OFONO_CONNECTION_CONTEXT, NULL, &error);
+  /* 4) Bring cellular back and verify. */
+  run_command(out, sizeof(out), "connmanctl", "enable", "cellular", NULL);
+  sleep(2);
+  run_command(out, sizeof(out), "connmanctl", "ActivatePdp", "1", NULL);
+  sleep(6);
+  if (ofono_context_exists(context_path) &&
+      !ofono_context_is_active(context_path)) {
+    GError *error = NULL;
+    GVariant *result = NULL;
+    GDBusProxy *proxy = g_dbus_proxy_new_sync(
+        g_dbus_conn, G_DBUS_PROXY_FLAGS_NONE, NULL, OFONO_SERVICE, context_path,
+        OFONO_CONNECTION_CONTEXT, NULL, &error);
     if (proxy) {
       result = g_dbus_proxy_call_sync(
           proxy, "SetProperty",
@@ -1230,8 +1473,33 @@ int ofono_set_apn_properties(const char *context_path, const char *apn,
         g_error_free(error);
       g_object_unref(proxy);
     }
+    sleep(3);
   }
 
+  /* #region agent log */
+  {
+    FILE *dbg = fopen("/tmp/apn-apply-debug.ndjson", "a");
+    ofono_read_context_apn("/ril_0/context1", got, sizeof(got));
+    if (dbg) {
+      fprintf(dbg,
+              "{\"sessionId\":\"0c2eee\",\"hypothesisId\":\"H_verify\","
+              "\"location\":\"ofono_set_apn_properties\",\"message\":\"after_apply\","
+              "\"data\":{\"want\":\"%s\",\"got\":\"%s\",\"active\":%d},"
+              "\"timestamp\":%ld000}\n",
+              apn ? apn : "", got, ofono_context_is_active("/ril_0/context1"),
+              (long)time(NULL));
+      fclose(dbg);
+    }
+  }
+  /* #endregion */
+
+  if (apn && apn[0]) {
+    if (ofono_read_context_apn("/ril_0/context1", got, sizeof(got)) != 0 ||
+        strcmp(got, apn) != 0) {
+      printf("[APN] verify failed want=%s got=%s\n", apn, got);
+      return -10;
+    }
+  }
   return 0;
 }
 

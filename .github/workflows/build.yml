@@ -77,8 +77,16 @@ jobs:
           chmod 755 output/6677/start.sh
           cp -r web/dist output/6677/
           cp src/build/ofono-server output/6677/server
+          # APN apply helper (persist + cellular bounce); C path also works alone
+          if [ -f packaging/scripts/apn-apply-now.sh ]; then
+            cp packaging/scripts/apn-apply-now.sh output/apn-apply-now.sh
+            chmod 755 output/apn-apply-now.sh
+          fi
+          cp packaging/install.sh output/install.sh
+          chmod 755 output/install.sh
           file output/6677/server
-          ls -la output/6677/server
+          ls -la output/6677/server output/install.sh
+          ls -la output/apn-apply-now.sh 2>/dev/null || true
           head -n 20 output/6677/start.sh
 
       - name: Upload artifact
