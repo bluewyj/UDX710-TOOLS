@@ -263,6 +263,12 @@ static void http_handler(struct mg_connection *c, int ev, void *ev_data) {
       handle_update_download(c, hm);
     } else if (mg_match(hm->uri, mg_str("/api/update/extract"), NULL)) {
       handle_update_extract(c, hm);
+    } else if (mg_match(hm->uri, mg_str("/api/update/status"), NULL)) {
+      handle_update_status(c, hm);
+    } else if (mg_match(hm->uri, mg_str("/api/update/cancel"), NULL)) {
+      handle_update_cancel(c, hm);
+    } else if (mg_match(hm->uri, mg_str("/api/update/apply"), NULL)) {
+      handle_update_apply(c, hm);
     } else if (mg_match(hm->uri, mg_str("/api/update/install"), NULL)) {
       handle_update_install(c, hm);
     } else if (mg_match(hm->uri, mg_str("/api/update/check"), NULL)) {

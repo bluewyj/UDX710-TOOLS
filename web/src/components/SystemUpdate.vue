@@ -23,6 +23,7 @@ const isDragging = ref(false)
 const checking = ref(false)
 const uploading = ref(false)
 const installing = ref(false)
+const applying = ref(false)
 const uploadProgress = ref(0)
 const installProgress = ref(0)
 const installStage = ref('')
@@ -31,16 +32,31 @@ const latestVersion = ref('')
 const updateAvailable = ref(false)
 const updateLog = ref([])
 
+// pending 状态机
+const pendingUpdate = ref(false)
+const pendingKind = ref('')
+const pendingMetaVersion = ref('')
+const restartNow = ref(true)
+
 // 计算属性
 const canUpdate = computed(() => {
+  if (pendingUpdate.value || applying.value) return false
   if (updateMode.value === 'file') return selectedFile.value !== null
   return updateUrl.value.trim() !== '' && (updateUrl.value.startsWith('http://') || updateUrl.value.startsWith('https://'))
 })
+
+const busy = computed(() => checking.value || uploading.value || installing.value || applying.value)
 
 const formattedFileSize = computed(() => {
   if (fileSize.value < 1024) return fileSize.value + ' B'
   if (fileSize.value < 1024 * 1024) return (fileSize.value / 1024).toFixed(1) + ' KB'
   return (fileSize.value / (1024 * 1024)).toFixed(2) + ' MB'
+})
+
+const pendingKindLabel = computed(() => {
+  if (pendingKind.value === 'meta') return t('update.pendingKindMeta')
+  if (pendingKind.value === 'legacy') return t('update.pendingKindLegacy')
+  return pendingKind.value || '-'
 })
 
 // 文件选择
@@ -89,6 +105,25 @@ async function fetchCurrentVersion() {
   }
 }
 
+// 获取 OTA pending 状态
+async function fetchUpdateStatus() {
+  try {
+    const res = await api.get('/api/update/status')
+    if (!res.ok || !res.data) {
+      throw new Error(res.data?.error || t('update.statusFailed'))
+    }
+    const data = res.data
+    if (data.current_version) {
+      currentVersion.value = data.current_version
+    }
+    pendingUpdate.value = !!data.pending_update
+    pendingKind.value = data.pending_kind || ''
+    pendingMetaVersion.value = data.pending_meta?.version || ''
+  } catch (e) {
+    console.error('Failed to get update status:', e)
+  }
+}
+
 // 检查更新
 async function checkUpdate() {
   checking.value = true
@@ -125,7 +160,7 @@ async function checkUpdate() {
   }
 }
 
-// 开始更新
+// 开始更新：上传/下载 → 解压 → 停在 pending（不自动 install/apply）
 async function startUpdate() {
   if (!canUpdate.value) return
   
@@ -161,7 +196,9 @@ async function startUpdate() {
     } else {
       addLog(t('update.downloadingPackage'))
       const downloadRes = await api.post('/api/update/download', { url: updateUrl.value })
-      if (downloadRes.error) throw new Error(downloadRes.error)
+      if (!downloadRes.ok || downloadRes.data?.error) {
+        throw new Error(downloadRes.data?.error || t('update.updateFailed'))
+      }
       uploadProgress.value = 100
       addLog(t('update.downloadComplete'))
     }
@@ -171,30 +208,21 @@ async function startUpdate() {
     installing.value = true
     installProgress.value = 0
     
-    // 步骤2: 解压
+    // 步骤2: 解压 → pending
     installStage.value = t('update.extractingPackage')
     addLog(t('update.extractingPackage') + '...')
     installProgress.value = 30
     
     const extractRes = await api.post('/api/update/extract')
-    if (extractRes.error) throw new Error(extractRes.error)
+    if (!extractRes.ok || extractRes.data?.error) {
+      throw new Error(extractRes.data?.error || t('update.updateFailed'))
+    }
     addLog(t('update.extractComplete'))
-    installProgress.value = 50
-    
-    // 步骤3: 安装
-    installStage.value = t('update.executingScript')
-    addLog(t('update.executingScript') + '...')
-    installProgress.value = 70
-    
-    const installRes = await api.post('/api/update/install')
-    if (installRes.error) throw new Error(installRes.error)
-    
     installProgress.value = 100
-    addLog('✓ ' + t('update.installComplete'))
-    if (installRes.output) addLog(t('update.output') + ': ' + installRes.output)
-    addLog(t('update.deviceRebooting'))
+    addLog('✓ ' + t('update.pendingReady'))
     
-    success(t('update.updateSuccess'))
+    await fetchUpdateStatus()
+    success(t('update.pendingReady'))
     
   } catch (e) {
     addLog('✗ ' + t('update.updateFailed') + ': ' + (e.message || t('common.error')))
@@ -203,6 +231,70 @@ async function startUpdate() {
     uploading.value = false
     installing.value = false
     clearFile()
+  }
+}
+
+// 应用 pending 更新
+async function applyPendingUpdate() {
+  if (!pendingUpdate.value || applying.value) return
+
+  const confirmed = await confirm({
+    title: t('update.apply'),
+    message: t('update.confirmApply'),
+    danger: true
+  })
+  if (!confirmed) return
+
+  applying.value = true
+  addLog(t('update.applying') + '...')
+  try {
+    const res = await api.post('/api/update/apply', { restart_now: !!restartNow.value })
+    if (!res.ok || res.data?.error) {
+      throw new Error(res.data?.error || res.data?.output || t('update.applyFailed'))
+    }
+    if (res.data?.output) addLog(t('update.output') + ': ' + res.data.output)
+    if (restartNow.value) {
+      addLog(t('update.deviceRebooting'))
+      success(t('update.applySuccessReboot'))
+    } else {
+      addLog('✓ ' + t('update.applySuccess'))
+      success(t('update.applySuccess'))
+    }
+    await fetchUpdateStatus()
+  } catch (e) {
+    addLog('✗ ' + t('update.applyFailed') + ': ' + (e.message || t('common.error')))
+    error(t('update.applyFailed') + ': ' + (e.message || t('common.error')))
+    await fetchUpdateStatus()
+  } finally {
+    applying.value = false
+  }
+}
+
+// 取消 pending 更新
+async function cancelPendingUpdate() {
+  if (!pendingUpdate.value || applying.value) return
+
+  const confirmed = await confirm({
+    title: t('update.cancelUpdate'),
+    message: t('update.confirmCancelUpdate'),
+    danger: true
+  })
+  if (!confirmed) return
+
+  applying.value = true
+  try {
+    const res = await api.post('/api/update/cancel')
+    if (!res.ok || res.data?.error) {
+      throw new Error(res.data?.error || t('update.cancelFailed'))
+    }
+    addLog(t('update.cancelSuccess'))
+    success(t('update.cancelSuccess'))
+    await fetchUpdateStatus()
+  } catch (e) {
+    error(t('update.cancelFailed') + ': ' + (e.message || t('common.error')))
+    await fetchUpdateStatus()
+  } finally {
+    applying.value = false
   }
 }
 
@@ -216,6 +308,7 @@ function sleep(ms) {
 }
 onMounted(() => {
   fetchCurrentVersion()
+  fetchUpdateStatus()
 })
 </script>
 
@@ -237,7 +330,7 @@ onMounted(() => {
           </p>
         </div>
       </div>
-      <button @click="checkUpdate" :disabled="checking || uploading || installing"
+      <button @click="checkUpdate" :disabled="busy || pendingUpdate"
         class="px-3 py-1.5 sm:px-4 sm:py-2 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 rounded-lg sm:rounded-xl text-xs sm:text-sm font-medium transition-all disabled:opacity-50">
         <i :class="checking ? 'fas fa-spinner animate-spin' : 'fas fa-sync-alt'" class="mr-1 sm:mr-2"></i>
         <span class="hidden sm:inline">{{ checking ? $t('update.checking') : $t('update.checkUpdate') }}</span>
@@ -245,14 +338,51 @@ onMounted(() => {
       </button>
     </div>
 
+    <!-- Pending 待应用面板 -->
+    <Transition name="slide">
+      <div v-if="pendingUpdate" class="mb-4 sm:mb-6 p-4 sm:p-5 bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/30 rounded-xl sm:rounded-2xl">
+        <div class="flex items-start space-x-3 mb-4">
+          <div class="w-10 h-10 rounded-xl bg-amber-500/20 flex items-center justify-center flex-shrink-0">
+            <i class="fas fa-pause-circle text-amber-600 dark:text-amber-400 text-lg"></i>
+          </div>
+          <div class="min-w-0 flex-1">
+            <p class="text-slate-900 dark:text-white font-semibold text-sm sm:text-base">{{ $t('update.pending') }}</p>
+            <p class="text-slate-600 dark:text-white/60 text-xs sm:text-sm mt-1">{{ $t('update.pendingReady') }}</p>
+            <div class="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs sm:text-sm text-slate-600 dark:text-white/60">
+              <span>{{ $t('update.pendingKind') }}: <span class="font-medium text-slate-800 dark:text-white/80">{{ pendingKindLabel }}</span></span>
+              <span v-if="pendingMetaVersion">{{ $t('update.pendingVersion') }}: <span class="font-mono text-emerald-600 dark:text-emerald-400">v{{ pendingMetaVersion }}</span></span>
+            </div>
+          </div>
+        </div>
+
+        <label class="flex items-center space-x-2 mb-4 cursor-pointer select-none">
+          <input type="checkbox" v-model="restartNow" :disabled="applying"
+            class="w-4 h-4 rounded border-slate-300 dark:border-white/30 bg-white dark:bg-white/10 text-emerald-500 focus:ring-emerald-500">
+          <span class="text-sm text-slate-700 dark:text-white/80">{{ $t('update.restartNow') }}</span>
+        </label>
+
+        <div class="flex flex-col sm:flex-row gap-2 sm:gap-3">
+          <button @click="applyPendingUpdate" :disabled="applying"
+            class="flex-1 py-2.5 sm:py-3 bg-gradient-to-r from-emerald-500 to-teal-500 text-white font-medium rounded-xl hover:shadow-lg hover:shadow-emerald-500/30 transition-all disabled:opacity-50 text-sm">
+            <i :class="applying ? 'fas fa-spinner animate-spin' : 'fas fa-check'" class="mr-2"></i>
+            {{ applying ? $t('update.applying') : $t('update.apply') }}
+          </button>
+          <button @click="cancelPendingUpdate" :disabled="applying"
+            class="flex-1 py-2.5 sm:py-3 bg-red-500/10 hover:bg-red-500/20 text-red-600 dark:text-red-400 font-medium rounded-xl transition-all disabled:opacity-50 text-sm">
+            <i class="fas fa-times mr-2"></i>{{ $t('update.cancelUpdate') }}
+          </button>
+        </div>
+      </div>
+    </Transition>
+
     <!-- 更新模式切换 -->
-    <div class="flex p-1 bg-slate-100 dark:bg-white/10 rounded-xl mb-4 sm:mb-6">
-      <button @click="updateMode = 'url'" :disabled="uploading || installing"
+    <div v-if="!pendingUpdate" class="flex p-1 bg-slate-100 dark:bg-white/10 rounded-xl mb-4 sm:mb-6">
+      <button @click="updateMode = 'url'" :disabled="busy"
         class="flex-1 py-2 sm:py-2.5 px-3 sm:px-4 rounded-lg text-xs sm:text-sm font-medium transition-all disabled:opacity-50"
         :class="updateMode === 'url' ? 'bg-white dark:bg-white/20 text-emerald-600 dark:text-emerald-400 shadow-sm' : 'text-slate-500 dark:text-white/50 hover:text-slate-700 dark:hover:text-white/70'">
         <i class="fas fa-link mr-1 sm:mr-2"></i>{{ $t('update.remoteUrl') }}
       </button>
-      <button @click="updateMode = 'file'" :disabled="uploading || installing"
+      <button @click="updateMode = 'file'" :disabled="busy"
         class="flex-1 py-2 sm:py-2.5 px-3 sm:px-4 rounded-lg text-xs sm:text-sm font-medium transition-all disabled:opacity-50"
         :class="updateMode === 'file' ? 'bg-white dark:bg-white/20 text-emerald-600 dark:text-emerald-400 shadow-sm' : 'text-slate-500 dark:text-white/50 hover:text-slate-700 dark:hover:text-white/70'">
         <i class="fas fa-file-archive mr-1 sm:mr-2"></i>{{ $t('update.localFile') }}
@@ -261,14 +391,14 @@ onMounted(() => {
 
 
     <!-- URL输入区域 / 文件上传区域 -->
-    <Transition name="fade" mode="out-in">
+    <Transition v-if="!pendingUpdate" name="fade" mode="out-in">
       <!-- URL输入区域 -->
       <div v-if="updateMode === 'url'" key="url" class="mb-4 sm:mb-6">
         <div class="relative">
           <div class="absolute left-3 sm:left-4 top-1/2 -translate-y-1/2 w-8 h-8 sm:w-10 sm:h-10 rounded-lg bg-emerald-500/10 flex items-center justify-center">
             <i class="fas fa-link text-emerald-500 text-sm sm:text-base"></i>
           </div>
-          <input type="url" v-model="updateUrl" :disabled="uploading || installing"
+          <input type="url" v-model="updateUrl" :disabled="busy"
             placeholder="https://example.com/update.zip"
             class="w-full pl-14 sm:pl-16 pr-4 py-3 sm:py-4 bg-slate-50 dark:bg-white/10 border border-slate-200 dark:border-white/20 rounded-xl sm:rounded-2xl text-slate-900 dark:text-white placeholder-slate-400 dark:placeholder-white/30 focus:border-emerald-400 focus:ring-2 focus:ring-emerald-400/20 transition-all disabled:opacity-50 text-sm sm:text-base">
         </div>
@@ -285,7 +415,7 @@ onMounted(() => {
           @drop.prevent="handleDrop"
           class="relative border-2 border-dashed rounded-xl sm:rounded-2xl p-6 sm:p-8 text-center transition-all duration-300 cursor-pointer"
           :class="isDragging ? 'border-emerald-500 bg-emerald-500/10' : 'border-slate-300 dark:border-white/20 hover:border-emerald-400 dark:hover:border-emerald-500/50 hover:bg-slate-50 dark:hover:bg-white/5'">
-          <input type="file" accept=".zip" @change="handleFileSelect" class="absolute inset-0 opacity-0 cursor-pointer" :disabled="uploading || installing">
+          <input type="file" accept=".zip" @change="handleFileSelect" class="absolute inset-0 opacity-0 cursor-pointer" :disabled="busy">
           <div class="w-12 h-12 sm:w-16 sm:h-16 mx-auto mb-3 sm:mb-4 rounded-xl sm:rounded-2xl bg-emerald-500/10 flex items-center justify-center">
             <i class="fas fa-cloud-upload-alt text-emerald-500 text-xl sm:text-2xl"></i>
           </div>
@@ -307,7 +437,7 @@ onMounted(() => {
                 <p class="text-slate-500 dark:text-white/50 text-xs sm:text-sm">{{ formattedFileSize }}</p>
               </div>
             </div>
-            <button @click="clearFile" :disabled="uploading || installing"
+            <button @click="clearFile" :disabled="busy"
               class="w-8 h-8 sm:w-10 sm:h-10 rounded-lg bg-red-500/10 hover:bg-red-500/20 text-red-500 flex items-center justify-center transition-all disabled:opacity-50 flex-shrink-0 ml-2">
               <i class="fas fa-times text-sm sm:text-base"></i>
             </button>
@@ -330,7 +460,7 @@ onMounted(() => {
                 {{ uploading ? (updateMode === 'file' ? $t('update.uploading') : $t('update.downloading')) : installStage }}
               </p>
               <p class="text-slate-500 dark:text-white/50 text-xs sm:text-sm">
-                {{ uploading ? $t('update.doNotClose') : $t('update.installingUpdate') }}
+                {{ uploading ? $t('update.doNotClose') : $t('update.extractingPackage') }}
               </p>
             </div>
           </div>
@@ -364,11 +494,11 @@ onMounted(() => {
       </div>
     </Transition>
 
-    <!-- 更新按钮 -->
-    <button @click="startUpdate" :disabled="!canUpdate || uploading || installing"
+    <!-- 更新按钮（pending 时隐藏） -->
+    <button v-if="!pendingUpdate" @click="startUpdate" :disabled="!canUpdate || busy"
       class="w-full py-3 sm:py-4 bg-gradient-to-r from-emerald-500 to-teal-500 text-white font-medium rounded-xl sm:rounded-2xl hover:shadow-lg hover:shadow-emerald-500/30 transition-all disabled:opacity-50 disabled:cursor-not-allowed text-sm sm:text-base">
       <i :class="uploading || installing ? 'fas fa-spinner animate-spin' : 'fas fa-rocket'" class="mr-2"></i>
-      {{ uploading ? $t('update.uploading') : installing ? $t('update.installing') : $t('update.startUpdate') }}
+      {{ uploading ? $t('update.uploading') : installing ? $t('update.extractingPackage') : $t('update.startUpdate') }}
     </button>
 
     <!-- 提示信息 -->

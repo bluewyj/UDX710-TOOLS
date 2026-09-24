@@ -48,6 +48,9 @@ void handle_update_upload(struct mg_connection *c, struct mg_http_message *hm);
 void handle_update_download(struct mg_connection *c,
                             struct mg_http_message *hm);
 void handle_update_extract(struct mg_connection *c, struct mg_http_message *hm);
+void handle_update_status(struct mg_connection *c, struct mg_http_message *hm);
+void handle_update_cancel(struct mg_connection *c, struct mg_http_message *hm);
+void handle_update_apply(struct mg_connection *c, struct mg_http_message *hm);
 void handle_update_install(struct mg_connection *c, struct mg_http_message *hm);
 void handle_update_check(struct mg_connection *c, struct mg_http_message *hm);
 
